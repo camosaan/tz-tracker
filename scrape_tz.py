@@ -77,11 +77,12 @@ def main():
 
     print(f"Next zone: {zone}, starts at {start_dt.isoformat()} (~{mins} minutes)")
 
-    if zone not in WATCHLIST:
+    force = os.environ.get("FORCE_DISCORD", "").lower() in ("1", "true", "yes")
+    if zone not in WATCHLIST and not force:
         print("Zone not in watchlist.")
         return
 
-    # Decide which alert stage we’re in
+    # Decide alert stage
     if mins >= 55:
         alert_stage = "60min"
     elif 25 <= mins <= 35:
@@ -89,18 +90,19 @@ def main():
     elif 0 < mins <= 7:
         alert_stage = "5min"
     else:
-        print("Not in an alert window.")
-        return
+        alert_stage = "outside_window"
 
     cache_key = f"{zone}_{alert_stage}"
 
-    # Check force flag
-    force = os.environ.get("FORCE_DISCORD", "").lower() in ("1", "true", "yes")
-    if cache.get(cache_key) and not force:
-        print("Already alerted for this stage.")
-        return
-    elif force:
-        print("FORCE_DISCORD flag set — sending alert regardless of cache.")
+    if not force:
+        if alert_stage == "outside_window":
+            print("Not in an alert window.")
+            return
+        if cache.get(cache_key):
+            print("Already alerted for this stage.")
+            return
+    else:
+        print("FORCE_DISCORD flag set — sending alert regardless of window or cache.")
 
     # Build message with bold zone name and Discord timestamps
     message = (
