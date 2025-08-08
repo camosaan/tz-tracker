@@ -47,6 +47,8 @@ def delete_last_message(cache):
         resp = requests.delete(url, timeout=10)
         if resp.status_code == 204:
             print(f"Deleted last message ID: {last_id}")
+            cache["last_message_id"] = None
+            save_cache(cache)
         else:
             print(f"Delete failed ({resp.status_code}): {resp.text[:200]}")
     except Exception as e:
@@ -94,15 +96,15 @@ ZONE_THEME = {
     "Cathedral": {"header": "🏰🕯️", "initial_tail": "Sanctify your gear"},
 }
 
-def build_message(zone: str, stage: str, epoch: int, local_time_str: str) -> str:
+def build_message(zone: str, stage: str, epoch: int) -> str:
     theme = ZONE_THEME.get(zone, {"header": "⚔️🔥", "initial_tail": "Prepare yourselves"})
     h = theme["header"]
     header_line = f"# {h} {zone} {h}"
 
     if stage == "initial":
-        timing_line = f"<@&{ROLE_ID}> **{zone}** up next! {theme['initial_tail']} @ {local_time_str}."
+        timing_line = f"<@&{ROLE_ID}> **{zone}** up next! {theme['initial_tail']} @ <t:{epoch}:t>."
     elif stage == "30min":
-        timing_line = f"<@&{ROLE_ID}> 30-minute warning! <t:{epoch}:R> @ {local_time_str}."
+        timing_line = f"<@&{ROLE_ID}> 30-minute warning! <t:{epoch}:R> @ <t:{epoch}:t>."
     elif stage == "15min":
         flavor = {
             "Worldstone Keep": "15 minutes to assemble!",
@@ -110,7 +112,7 @@ def build_message(zone: str, stage: str, epoch: int, local_time_str: str) -> str
             "The Secret Cow Level": "15 minutes until the herd is unleashed!",
             "Cathedral": "15 minutes until the bells toll!",
         }.get(zone, "15 minutes remaining!")
-        timing_line = f"<@&{ROLE_ID}> {flavor} <t:{epoch}:R> @ {local_time_str}."
+        timing_line = f"<@&{ROLE_ID}> {flavor} <t:{epoch}:R> @ <t:{epoch}:t>."
     else:  # stage == "5min"
         flavor = {
             "Worldstone Keep": "Final call — fight begins",
@@ -118,20 +120,12 @@ def build_message(zone: str, stage: str, epoch: int, local_time_str: str) -> str
             "The Secret Cow Level": "Final call — the pasture gates open",
             "Cathedral": "Final call — the bells will toll",
         }.get(zone, "Final call")
-        timing_line = f"<@&{ROLE_ID}> {flavor} <t:{epoch}:R> @ {local_time_str}!"
+        timing_line = f"<@&{ROLE_ID}> {flavor} <t:{epoch}:R> @ <t:{epoch}:t>!"
 
     return f"{header_line}\n{timing_line}"
 
 # ----- Stage logic -----
 def determine_stage(mins_to_hour: int) -> str:
-    """
-    Map minutes-before-hour to checkpoints:
-    :05 -> ~55 min  => 'initial'
-    :30 -> ~30 min  => '30min'
-    :45 -> ~15 min  => '15min'
-    :55 -> ~5  min  => '5min'
-    With a bit of slack.
-    """
     if mins_to_hour >= 50:
         return "initial"
     if 26 <= mins_to_hour <= 35:
@@ -149,22 +143,15 @@ def truthy_env(name: str) -> bool:
 def main():
     cache = load_cache()
 
-    # Flag: send every initial message as a demo (no scraping/windows/cache/deletes)
-    send_all_initials = truthy_env("SEND_ALL_INITIALS")
-    if send_all_initials:
+    # Demo mode
+    if truthy_env("SEND_ALL_INITIALS"):
         start_dt = next_hour_utc()
         epoch = int(start_dt.timestamp())
-        try:
-            local_time_str = start_dt.astimezone().strftime("%-I:%M %p")
-        except ValueError:
-            local_time_str = start_dt.astimezone().strftime("%#I:%M %p")
-
         print("SEND_ALL_INITIALS enabled — posting initial messages for all watchlist zones.")
         for zone in WATCHLIST:
-            msg = build_message(zone, "initial", epoch, local_time_str)
+            msg = build_message(zone, "initial", epoch)
             message_id = send_discord_message(msg)
             print(f"Posted demo initial for {zone} (ID: {message_id})")
-        # Do NOT modify cache or delete anything in demo mode.
         return
 
     # Normal/forced flow
@@ -176,14 +163,17 @@ def main():
     start_dt = next_hour_utc()
     mins = minutes_until(start_dt)
     epoch = int(start_dt.timestamp())
-    try:
-        local_time_str = start_dt.astimezone().strftime("%-I:%M %p")
-    except ValueError:
-        local_time_str = start_dt.astimezone().strftime("%#I:%M %p")
 
     print(f"Next zone: {zone}, starts at {start_dt.isoformat()} (~{mins} minutes)")
 
     force = truthy_env("FORCE_DISCORD")
+
+    # Special case: at initial (:05) check, if zone is not in watchlist → delete last message only
+    if not force and zone not in WATCHLIST and determine_stage(mins) == "initial":
+        print("Zone not in watchlist at :05 check — deleting last message.")
+        delete_last_message(cache)
+        return
+
     if zone not in WATCHLIST and not force:
         print("Zone not in watchlist.")
         return
@@ -201,10 +191,9 @@ def main():
     if force:
         print("FORCE_DISCORD set — sending alert regardless of window or cache.")
 
-    # Delete previous message, then send the new one
     delete_last_message(cache)
     effective_stage = "initial" if (force and stage == "outside_window") else stage
-    message = build_message(zone, effective_stage, epoch, local_time_str)
+    message = build_message(zone, effective_stage, epoch)
     message_id = send_discord_message(message)
     print(f"Sent alert (ID: {message_id}) for stage '{effective_stage}':\n{message}")
 
