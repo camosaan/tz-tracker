@@ -25,7 +25,7 @@ def send_discord_message(message: str):
     resp.raise_for_status()
 
 def get_next_zone():
-    url = "https://d2emu.com/terrorzone"  # replace with actual tracker URL
+    url = "https://diablo2.io/tzonetracker.php"  # replace with actual tracker URL
     resp = requests.get(url, timeout=10)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
