@@ -2,11 +2,15 @@ name: TZ Watcher
 
 on:
   schedule:
-    - cron: "*/5 * * * *"  # every 5 minutes (UTC)
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       force:
         description: "Force send if a watched zone is present (bypass minute guard)"
+        required: false
+        default: "false"
+      debug:
+        description: "Enable debug logging"
         required: false
         default: "false"
 
@@ -16,8 +20,8 @@ jobs:
     env:
       LOCAL_TZ: Europe/London
       WATCH_TERMS: "Burial Grounds,Crypt,Mausoleum,Far Oasis"
-      # Convert the workflow input to an env var the script reads
       FORCE_SEND: ${{ github.event.inputs.force }}
+      DEBUG: ${{ github.event.inputs.debug }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,7 +34,8 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4
+          pip install requests beautifulsoup4 playwright
+          python -m playwright install --with-deps chromium
 
       - name: Run watcher
         env:
@@ -39,4 +44,5 @@ jobs:
           LOCAL_TZ: ${{ env.LOCAL_TZ }}
           WATCH_TERMS: ${{ env.WATCH_TERMS }}
           FORCE_SEND: ${{ env.FORCE_SEND }}
+          DEBUG: ${{ env.DEBUG }}
         run: python watcher.py
