@@ -25,11 +25,38 @@ def save_cache(data):
     """Save the sent-alert cache to file."""
     CACHE_FILE.write_text(json.dumps(data))
 
+def delete_last_message(cache):
+    """Delete the last Discord message sent by this script, if any."""
+    last_id = cache.get("last_message_id")
+    if not last_id:
+        return
+
+    # Extract webhook.id and webhook.token from WEBHOOK_URL
+    try:
+        parts = WEBHOOK_URL.strip("/").split("/")
+        webhook_id = parts[-2]
+        webhook_token = parts[-1]
+    except Exception as e:
+        print(f"Could not parse webhook URL for deletion: {e}")
+        return
+
+    delete_url = f"https://discord.com/api/webhooks/{webhook_id}/{webhook_token}/messages/{last_id}"
+    try:
+        resp = requests.delete(delete_url, timeout=10)
+        if resp.status_code == 204:
+            print(f"Deleted last message ID: {last_id}")
+        else:
+            print(f"Failed to delete message ID {last_id}, status: {resp.status_code}")
+    except Exception as e:
+        print(f"Error deleting last message: {e}")
+
 def send_discord_message(message: str):
-    """Send a message to Discord via webhook."""
+    """Send a message to Discord via webhook and return its message_id."""
     payload = {"content": message}
     resp = requests.post(WEBHOOK_URL, json=payload)
     resp.raise_for_status()
+    data = resp.json()
+    return data.get("id")
 
 def get_next_zone():
     """Scrape the diablo2.io tracker page and return the Next zone name."""
@@ -107,15 +134,20 @@ def main():
     else:
         print("FORCE_DISCORD flag set — sending alert regardless of window or cache.")
 
-    # Build single fancy message with header + timing
+    # Delete the last message before sending a new one
+    delete_last_message(cache)
+
+    # Build fancy message with header + timing
     header_line = f"# ⚔️🔥 {zone} 🔥⚔️"
     timing_line = f"<@&{ROLE_ID}> up next <t:{epoch}:R> @ {local_time_str}"
     message = f"{header_line}\n{timing_line}"
 
-    send_discord_message(message)
-    print(f"Sent alert:\n{message}")
+    # Send the new message and store its ID
+    message_id = send_discord_message(message)
+    print(f"Sent alert (ID: {message_id}):\n{message}")
 
     cache[cache_key] = True
+    cache["last_message_id"] = message_id
     save_cache(cache)
 
 if __name__ == "__main__":
