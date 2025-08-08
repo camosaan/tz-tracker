@@ -9,59 +9,59 @@ import pathlib
 WATCHLIST = {"The Ancients' Way", "Icy Cellar"}
 
 # Discord settings from GitHub secrets
-WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
+WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"].strip()
 ROLE_ID = os.environ["DISCORD_ROLE_ID"]
 
 # Cache file location
 CACHE_FILE = pathlib.Path("tz_alert_cache.json")
 
 def load_cache():
-    """Load the sent-alert cache from file."""
     if CACHE_FILE.exists():
         return json.loads(CACHE_FILE.read_text())
     return {}
 
 def save_cache(data):
-    """Save the sent-alert cache to file."""
     CACHE_FILE.write_text(json.dumps(data))
 
+def webhook_url_with_wait():
+    # Ensure we get JSON back with the created message (contains id)
+    if "?" in WEBHOOK_URL:
+        if "wait=true" in WEBHOOK_URL:
+            return WEBHOOK_URL
+        return WEBHOOK_URL + "&wait=true"
+    return WEBHOOK_URL + "?wait=true"
+
+def webhook_base_url():
+    # For deletes: same webhook URL, no querystring, then /messages/{id}
+    return WEBHOOK_URL.split("?")[0].rstrip("/")
+
 def delete_last_message(cache):
-    """Delete the last Discord message sent by this script, if any."""
     last_id = cache.get("last_message_id")
     if not last_id:
         return
-
-    # Extract webhook.id and webhook.token from WEBHOOK_URL
-    try:
-        parts = WEBHOOK_URL.strip("/").split("/")
-        webhook_id = parts[-2]
-        webhook_token = parts[-1]
-    except Exception as e:
-        print(f"Could not parse webhook URL for deletion: {e}")
-        return
-
-    delete_url = f"https://discord.com/api/webhooks/{webhook_id}/{webhook_token}/messages/{last_id}"
+    delete_url = f"{webhook_base_url()}/messages/{last_id}"
     try:
         resp = requests.delete(delete_url, timeout=10)
         if resp.status_code == 204:
             print(f"Deleted last message ID: {last_id}")
         else:
-            print(f"Failed to delete message ID {last_id}, status: {resp.status_code}")
+            print(f"Failed to delete message ID {last_id}, status: {resp.status_code}, body: {resp.text[:200]}")
     except Exception as e:
         print(f"Error deleting last message: {e}")
 
 def send_discord_message(message: str):
     """Send a message to Discord via webhook and return its message_id."""
     payload = {"content": message}
-    resp = requests.post(WEBHOOK_URL, json=payload)
+    resp = requests.post(webhook_url_with_wait(), json=payload, timeout=15)
     resp.raise_for_status()
+    # With ?wait=true we get the created message as JSON
     data = resp.json()
     return data.get("id")
 
 def get_next_zone():
     """Scrape the diablo2.io tracker page and return the Next zone name."""
     url = "https://diablo2.io/tzonetracker.php"
-    resp = requests.get(url, timeout=10)
+    resp = requests.get(url, timeout=15)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -81,12 +81,10 @@ def get_next_zone():
     return None
 
 def next_hour_utc():
-    """Return datetime for the top of the next hour in UTC."""
     now = datetime.now(timezone.utc)
     return (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
 
 def minutes_until(dt):
-    """Return whole minutes until a datetime from now."""
     now = datetime.now(timezone.utc)
     return int((dt - now).total_seconds() // 60)
 
@@ -102,8 +100,11 @@ def main():
     mins = minutes_until(start_dt)
     epoch = int(start_dt.timestamp())
 
-    # Local time for absolute display
-    local_time_str = start_dt.astimezone().strftime("%-I:%M %p")
+    # Local time for absolute display (note: %-I works on Linux; if on Windows, use %#I)
+    try:
+        local_time_str = start_dt.astimezone().strftime("%-I:%M %p")
+    except ValueError:
+        local_time_str = start_dt.astimezone().strftime("%#I:%M %p")
 
     print(f"Next zone: {zone}, starts at {start_dt.isoformat()} (~{mins} minutes)")
 
@@ -137,12 +138,12 @@ def main():
     # Delete the last message before sending a new one
     delete_last_message(cache)
 
-    # Build fancy message with header + timing
+    # Build message (big header + timing)
     header_line = f"# ⚔️🔥 {zone} 🔥⚔️"
     timing_line = f"<@&{ROLE_ID}> up next <t:{epoch}:R> @ {local_time_str}"
     message = f"{header_line}\n{timing_line}"
 
-    # Send the new message and store its ID
+    # Send and store message id
     message_id = send_discord_message(message)
     print(f"Sent alert (ID: {message_id}):\n{message}")
 
