@@ -38,14 +38,24 @@ def webhook_base_url():
     return WEBHOOK_URL.split("?")[0].rstrip("/")
 
 def delete_message_by_id(message_id: str) -> bool:
+    """Delete a message by webhook ID, return True if deleted/missing, False if fail."""
     if not message_id:
         return False
     url = f"{webhook_base_url()}/messages/{message_id}"
     try:
-        resp = requests.delete(url, timeout=10)
-        if resp.status_code == 204:
-            return True
-        return resp.status_code == 404  # treat not found as "deleted"
+        resp = requests.delete(url, timeout=12)
+        return resp.status_code in (204, 404)  # treat 404 as "already gone"
+    except Exception:
+        return False
+
+def edit_message_by_id(message_id: str, content: str) -> bool:
+    """PATCH the existing webhook message. Returns True on success."""
+    if not message_id:
+        return False
+    url = f"{webhook_base_url()}/messages/{message_id}"
+    try:
+        resp = requests.patch(url, json={"content": content}, timeout=12)
+        return resp.status_code == 200
     except Exception:
         return False
 
@@ -56,7 +66,7 @@ def send_discord_message(message: str) -> str | None:
 
 # ----- Scraper -----
 def scrape_current_and_next(retries=2, delay=5):
-    """Try scraping current/next, retry if next is None."""
+    """Try scraping current/next, retry if next is None (page sometimes lags)."""
     for attempt in range(retries + 1):
         current_zone, next_zone = _scrape_once()
         if next_zone:
@@ -160,39 +170,50 @@ def determine_stage(mins_to_hour):
 def main():
     cache = load_cache()
 
-    # Scrape (with retry if next missing)
+    # Scrape (retry if "next" missing)
     current_zone, next_zone = scrape_current_and_next()
 
     next_start_dt = next_hour_utc()
     mins_to_next = minutes_until(next_start_dt)
     epoch_next = int(next_start_dt.timestamp())
-    epoch_current_end = epoch_next
+    epoch_current_end = epoch_next  # current ends when next starts
 
-    print(f"Current: {current_zone} | Next: {next_zone} | {mins_to_next} mins to next")
+    print(f"Current: {current_zone or 'TBD'} | Next: {next_zone or 'TBD'} | {mins_to_next} mins to next")
 
-    # --- INFO POST ---
-    needs_info_update = (
-        not cache.get("last_info_message_id")
-        or cache.get("last_info_current_zone") != current_zone
-        or cache.get("last_info_next_zone") != next_zone
-    )
+    # --- INFO POST (edit in place if present; else create) ---
+    info_content = build_info_message(current_zone, epoch_current_end, next_zone, epoch_next)
 
-    if needs_info_update:
-        if cache.get("last_info_message_id"):
-            delete_message_by_id(cache["last_info_message_id"])
-        info_msg = build_info_message(current_zone, epoch_current_end, next_zone, epoch_next)
-        new_info_id = send_discord_message(info_msg)
-        cache["last_info_message_id"] = new_info_id
+    last_info_id = cache.get("last_info_message_id")
+    last_info_cur = cache.get("last_info_current_zone")
+    last_info_next = cache.get("last_info_next_zone")
+
+    # If no post yet, or zones changed (including TBD->known), update
+    if not last_info_id:
+        new_id = send_discord_message(info_content)
+        cache["last_info_message_id"] = new_id
         cache["last_info_current_zone"] = current_zone
         cache["last_info_next_zone"] = next_zone
         save_cache(cache)
-        print(f"Info post updated (ID: {new_info_id})")
+        print(f"Info post created (ID: {new_id})")
+    elif last_info_cur != current_zone or last_info_next != next_zone:
+        if edit_message_by_id(last_info_id, info_content):
+            print(f"Info post edited (ID: {last_info_id})")
+            cache["last_info_current_zone"] = current_zone
+            cache["last_info_next_zone"] = next_zone
+            save_cache(cache)
+        else:
+            deleted = delete_message_by_id(last_info_id)
+            new_id = send_discord_message(info_content)
+            cache["last_info_message_id"] = new_id
+            cache["last_info_current_zone"] = current_zone
+            cache["last_info_next_zone"] = next_zone
+            save_cache(cache)
+            print(f"Info post replaced (old deleted={deleted}) new ID: {new_id}")
 
     # --- ALERTS ---
     stage = determine_stage(mins_to_next)
     if not stage:
         return
-
     if next_zone not in WATCHLIST:
         return
 
@@ -200,16 +221,17 @@ def main():
     if cache.get(cache_key):
         return  # already sent this stage
 
-    # delete last alert if exists
-    if cache.get("last_alert_message_id"):
-        delete_message_by_id(cache["last_alert_message_id"])
+    # Replace previous alert message (if any)
+    last_alert_id = cache.get("last_alert_message_id")
+    if last_alert_id:
+        delete_message_by_id(last_alert_id)
 
     alert_msg = build_alert_message(next_zone, stage, epoch_next)
     new_alert_id = send_discord_message(alert_msg)
     cache[cache_key] = True
     cache["last_alert_message_id"] = new_alert_id
     save_cache(cache)
-    print(f"Alert sent for {next_zone} ({stage})")
+    print(f"Alert sent for {next_zone} ({stage}), ID: {new_alert_id}")
 
 if __name__ == "__main__":
     main()
