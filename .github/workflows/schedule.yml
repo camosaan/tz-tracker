@@ -3,13 +3,21 @@ name: TZ Watcher
 on:
   schedule:
     - cron: "*/5 * * * *"  # every 5 minutes (UTC)
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force send if a watched zone is present (bypass minute guard)"
+        required: false
+        default: "false"
 
 jobs:
   run:
     runs-on: ubuntu-latest
     env:
-      LOCAL_TZ: Europe/London   # your tz; Discord tags localize for everyone anyway
+      LOCAL_TZ: Europe/London
+      WATCH_TERMS: "Burial Grounds,Crypt,Mausoleum,Far Oasis"
+      # Convert the workflow input to an env var the script reads
+      FORCE_SEND: ${{ github.event.inputs.force }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,4 +36,7 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DISCORD_ROLE_ID: ${{ secrets.DISCORD_ROLE_ID }}
+          LOCAL_TZ: ${{ env.LOCAL_TZ }}
+          WATCH_TERMS: ${{ env.WATCH_TERMS }}
+          FORCE_SEND: ${{ env.FORCE_SEND }}
         run: python watcher.py
