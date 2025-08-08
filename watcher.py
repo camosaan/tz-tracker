@@ -17,11 +17,11 @@ WATCH_TERMS_LC = {t.lower() for t in WATCH_TERMS}
 SEND_MINUTES = {5, 30, 45, 55}
 URL = "https://d2emu.com/tz"
 
-# -------- Playwright extraction using text anchor + ancestor .row --------
+# ---------- robust Playwright extraction (anchor + ancestor with links) ----------
 def fetch_next_tz_playwright() -> tuple[str | None, list[str]]:
     """
-    Find the node that contains 'Next Terror Zone', walk to its closest
-    ancestor .row, then read the two columns: left text + right links.
+    Find element containing 'Next Terror Zone', walk up ancestors until we find
+    a container that ALSO has 'ul li a' zone links. Return (container_text, zones[]).
     """
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
@@ -33,7 +33,6 @@ def fetch_next_tz_playwright() -> tuple[str | None, list[str]]:
         page.wait_for_timeout(1500)
 
         try:
-            # Anchor on visible text
             anchor = page.locator("text=Next Terror Zone").first
             anchor.wait_for(state="visible", timeout=5000)
         except PWTimeout:
@@ -41,44 +40,56 @@ def fetch_next_tz_playwright() -> tuple[str | None, list[str]]:
             browser.close()
             return None, []
 
-        # Climb to nearest .row ancestor
-        row = anchor.locator("xpath=ancestor::div[contains(@class,'row')][1]")
-        try:
-            row.wait_for(state="attached", timeout=3000)
-        except PWTimeout:
-            if DEBUG: print("[DEBUG] Anchor found but no .row ancestor located.")
-            browser.close()
-            return None, []
-
-        left = row.locator("css=div.col").nth(0)
-        right = row.locator("css=div.col").nth(1)
-
-        left_text = ""
-        try:
-            left_text = left.inner_text().strip()
-        except Exception:
-            pass
-
-        zones = []
-        try:
-            zones = [t.strip() for t in right.locator("ul.list-unstyled li a").all_inner_texts() if t.strip()]
-        except Exception:
-            pass
-
-        if DEBUG:
-            print(f"[DEBUG] left_text present: {bool(left_text)}")
-            if left_text:
-                print("---- LEFT (Next TZ) ----")
-                print(left_text)
-                print("-------- END ---------")
-            print(f"[DEBUG] zones: {zones}")
+        result = page.evaluate(
+            """
+            (anchor) => {
+              // climb up to 12 ancestors; pick the first that has at least one UL->LI->A
+              let node = anchor;
+              for (let i=0; i<12 && node; i++) {
+                const links = Array.from(node.querySelectorAll("ul li a"))
+                                    .map(a => (a.innerText || "").trim())
+                                    .filter(Boolean);
+                const text = (node.innerText || "").trim();
+                if (links.length && text.toLowerCase().includes("next terror zone")) {
+                  return {text, links};
+                }
+                node = node.parentElement;
+              }
+              // fallback: search sibling containers
+              node = anchor.parentElement;
+              for (let i=0; i<12 && node; i++) {
+                const sibs = Array.from(node.children);
+                for (const s of sibs) {
+                  const links = Array.from(s.querySelectorAll("ul li a"))
+                                      .map(a => (a.innerText || "").trim())
+                                      .filter(Boolean);
+                  const text = (s.innerText || "").trim();
+                  if (links.length && text.toLowerCase().includes("next terror zone")) {
+                    return {text, links};
+                  }
+                }
+                node = node.parentElement;
+              }
+              return null;
+            }
+            """,
+            anchor
+        )
 
         browser.close()
-        return (left_text if left_text else None), zones
+
+        if not result:
+            return None, []
+
+        # normalize whitespace
+        text = re.sub(r"[ \t]+", " ", result["text"])
+        text = re.sub(r"\n+", "\n", text).strip()
+        zones = [s for s in result.get("links", []) if s]
+        return text, zones
 
 # ----------------------- helpers -----------------------
-def parse_next_timestamp(left_text: str, tz: ZoneInfo) -> datetime | None:
-    m = re.search(r"(\d{1,2}/\d{1,2}/\d{4}),\s*(\d{1,2}:\d{2}:\d{2})", left_text or "")
+def parse_next_timestamp(block_text: str, tz: ZoneInfo) -> datetime | None:
+    m = re.search(r"(\d{1,2}/\d{1,2}/\d{4}),\s*(\d{1,2}:\d{2}:\d{2})", block_text or "")
     if not m:
         return None
     d, t = m.group(1), m.group(2)
@@ -93,7 +104,7 @@ def parse_next_timestamp(left_text: str, tz: ZoneInfo) -> datetime | None:
 def should_send_now(now_local: datetime) -> bool:
     return FORCE or (now_local.minute in SEND_MINUTES)
 
-def send_webhook(zones: list[str], start_dt_local: datetime, left_text: str):
+def send_webhook(zones: list[str], start_dt_local: datetime, context_text: str):
     epoch = int(start_dt_local.timestamp())
     abs_tag = f"<t:{epoch}:t>"
     rel_tag = f"<t:{epoch}:R>"
@@ -105,7 +116,7 @@ def send_webhook(zones: list[str], start_dt_local: datetime, left_text: str):
         f"Starts at {abs_tag} ({rel_tag})\n"
         f"Source: {URL}"
     )
-    snippet = "```\n" + (left_text[:1700] if left_text else "") + "\n```"
+    snippet = "```\n" + (context_text[:1700] if context_text else "") + "\n```"
     r = requests.post(WEBHOOK_URL, json={"content": content + "\n" + snippet}, timeout=20)
     r.raise_for_status()
 
@@ -113,8 +124,16 @@ def send_webhook(zones: list[str], start_dt_local: datetime, left_text: str):
 def main():
     tz = ZoneInfo(LOCAL_TZ)
 
-    left_text, zones = fetch_next_tz_playwright()
-    if not left_text:
+    block_text, zones = fetch_next_tz_playwright()
+    if DEBUG:
+        print(f"[DEBUG] block_text present: {bool(block_text)}")
+        if block_text:
+            print("---- BLOCK (Next TZ) ----")
+            print(block_text)
+            print("-------- END ---------")
+        print(f"[DEBUG] zones: {zones}")
+
+    if not block_text:
         print("Could not locate the Next Terror Zone block — exiting.")
         return
 
@@ -124,7 +143,7 @@ def main():
         print("No watched terms in Next Terror Zone — exiting.")
         return
 
-    start_dt_local = parse_next_timestamp(left_text, tz)
+    start_dt_local = parse_next_timestamp(block_text, tz)
     if not start_dt_local:
         print("Could not parse timestamp; skipping send to avoid wrong times.")
         return
@@ -132,7 +151,7 @@ def main():
     now_local = datetime.now(tz)
     if should_send_now(now_local):
         print(f"Sending at {now_local.isoformat()} hits={hits} start={start_dt_local.isoformat()} force={FORCE}")
-        send_webhook(hits, start_dt_local, left_text)
+        send_webhook(hits, start_dt_local, block_text)
     else:
         print(f"Match present but not a send minute ({now_local.minute}). Skipping. force={FORCE}")
 
