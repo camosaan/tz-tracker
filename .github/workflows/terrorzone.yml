@@ -2,7 +2,7 @@ name: Terror Zone Alerts
 
 on:
   schedule:
-    - cron: "5,30,45,55 * * * *"   # 05, 30, 45, 55 past each hour
+    - cron: "*/5 * * * *"   # run every 5 minutes; script will decide if it's a post window
   workflow_dispatch:
     inputs:
       force_discord:
@@ -17,10 +17,21 @@ on:
 permissions:
   contents: write
 
+# Avoid overlapping runs if one is delayed by GitHub
+concurrency:
+  group: tz-alerts
+  cancel-in-progress: true
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
     steps:
+      - name: Log start time
+        run: |
+          echo "Runner time (UTC):   $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          echo "Runner time (local): $(date +'%Y-%m-%dT%H:%M:%S%z')"
+          echo "GitHub event: ${{ github.event_name }}"
+
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
@@ -36,10 +47,19 @@ jobs:
 
       - name: Run scraper
         env:
+          # Secrets/config
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DISCORD_ROLE_ID: ${{ secrets.DISCORD_ROLE_ID }}
+
+          # Manual run inputs
           FORCE_DISCORD: ${{ github.event.inputs.force_discord }}
           SEND_ALL_INITIALS: ${{ github.event.inputs.send_all_initials }}
+
+          # Gate posting inside the script:
+          # Only send when current UTC minute is within WINDOW_MINUTES
+          # of one of TARGET_MINUTES (comma-separated).
+          TARGET_MINUTES: "5,30,45,55"
+          WINDOW_MINUTES: "4"
         run: python scrape_tz.py
 
       - name: Check if cache changed
