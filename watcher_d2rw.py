@@ -1,16 +1,11 @@
-import os
-import re
-import requests
+import os, re, requests
 from datetime import datetime, timezone
 
 URL = "https://d2runewizard.com/terror-zone-tracker"
 
-# --- Discord / config ---
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 ROLE_ID     = os.getenv("DISCORD_ROLE_ID", "").strip()
 
-# If you want to override in repo vars, set WATCH_TERMS there.
-# Otherwise we default to your shortlist here.
 DEFAULT_WATCH = "Chaos Sanctuary,Worldstone Keep,World Stone Keep,Catacombs,Secret Cow Level,Cow Level,Cows"
 WATCH_TERMS = os.getenv("WATCH_TERMS", DEFAULT_WATCH)
 WATCH = [w.strip() for w in WATCH_TERMS.split(",") if w.strip()]
@@ -19,7 +14,6 @@ DEBUG       = os.getenv("DEBUG", "false").lower() in {"1","true","yes"}
 FORCE       = os.getenv("FORCE_SEND", "false").lower() in {"1","true","yes"}
 TEST_PING   = os.getenv("TEST_PING", "false").lower() in {"1","true","yes"}
 
-# minutes past the hour (UTC) when we allow sends
 SEND_MINUTES = {5, 30, 45, 55}
 
 HEADERS = {
@@ -27,6 +21,24 @@ HEADERS = {
                    "AppleWebKit/537.36 (KHTML, like Gecko) "
                    "Chrome/124.0.0.0 Safari/537.36")
 }
+
+# Known zone names so we can *display* what we found in the NEXT block
+KNOWN_ZONES = [
+    "Blood Moor","Den of Evil","Cold Plains","Burial Grounds","Crypt","Mausoleum",
+    "Stony Field","Tristram","Dark Wood","Black Marsh","Tower Cellar","Barracks",
+    "Jail","Inner Cloister","Cathedral","Catacombs","Pit","Tamoe Highland",
+    "Sewers","Rocky Waste","Dry Hills","Halls of the Dead","Far Oasis","Maggot Lair",
+    "Lost City","Valley of Snakes","Claw Viper Temple","Stony Tomb","Ancient Tunnels",
+    "Arcane Sanctuary",
+    "Spider Forest","Arachnid Lair","Great Marsh","Flayer Jungle","Flayer Dungeon",
+    "Kurast Bazaar","Ruined Temple","Disused Fane","Upper Kurast","Travincal",
+    "Durance of Hate",
+    "Outer Steppes","Plains of Despair","City of the Damned","River of Flame","Chaos Sanctuary",
+    "Bloody Foothills","Frigid Highlands","Abaddon","Arreat Plateau","Pit of Acheron",
+    "Crystalline Passage","Frozen River","Glacial Trail","Drifter Cavern","Frozen Tundra",
+    "Infernal Pit","Ancient's Way","Icy Cellar","Worldstone Keep","Throne of Destruction",
+    "Secret Cow Level","Cow Level","Cows"
+]
 
 def should_send(now_utc: datetime) -> bool:
     return FORCE or (now_utc.minute in SEND_MINUTES)
@@ -41,6 +53,34 @@ def send_discord(message: str):
         print(f"[WARN] Discord webhook {r.status_code}: {r.text[:300]}")
     else:
         print("[INFO] Discord message sent.")
+
+def slice_next_block(html: str) -> str | None:
+    """Return HTML slice that corresponds to the *Next* TZ card content."""
+    i = html.lower().find("next terror zone")
+    if i == -1:
+        return None
+    # take a forward window; the zone names are rendered just after the timer block
+    # stop at the next H2/H3 (start of another card) if any
+    fwd = html[i:i+120000]  # generous
+    m = re.search(r"</h[23]>", fwd, flags=re.IGNORECASE)
+    start = m.end() if m else 0
+    # cut until the next heading/card boundary
+    m2 = re.search(r"<h[23][^>]*>", fwd[start:], flags=re.IGNORECASE)
+    end = start + m2.start() if m2 else len(fwd)
+    return fwd[start:end]
+
+def find_names(block: str, names: list[str]) -> list[str]:
+    low = block.lower()
+    found = [n for n in names if n.lower() in low]
+    # keep first-seen order & dedupe
+    seen = set()
+    out = []
+    for n in found:
+        k = n.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(n)
+    return out
 
 def main():
     if not WEBHOOK_URL:
@@ -58,62 +98,52 @@ def main():
     resp.raise_for_status()
     html = resp.text
 
-    # Find the "Next Terror Zone" heading, then scan forward from there
-    idx_next = html.lower().find("next terror zone")
-    if idx_next == -1:
-        print("Error: Could not find the 'Next Terror Zone' text.")
+    block = slice_next_block(html)
+    if not block:
+        print("Error: Could not isolate the Next Terror Zone block.")
         if DEBUG:
-            print("[DEBUG] HTML preview:", html[:1000])
+            print("[DEBUG] HTML preview:", html[:1200])
         return
 
-    # Take a generous forward slice (names should be in here)
-    forward = html[idx_next: idx_next + 50000]  # plenty of room
     if DEBUG:
-        prev = re.sub(r"\s+", " ", forward[:800])
-        print(f"[DEBUG] Next-section preview: {prev}")
+        prev = re.sub(r"\s+", " ", block)[:800]
+        print(f"[DEBUG] Next block preview: {prev}")
 
-    # Look for any watch term inside this forward slice
-    low = forward.lower()
-    hits = []
-    for term in WATCH:
-        if term.lower() in low:
-            hits.append(term)
+    # Show what we believe the NEXT zones are (for sanity)
+    discovered = find_names(block, KNOWN_ZONES)
+    if discovered:
+        print("[INFO] Parsed NEXT zones:", ", ".join(discovered))
 
-    # Deduplicate but keep order of first appearance
-    seen = set()
-    hits = [h for h in hits if not (h.lower() in seen or seen.add(h.lower()))]
-
+    # Only alert if one of YOUR watch terms is present
+    hits = find_names(block, WATCH)
     if not hits:
         print("No watched zones in Next Terror Zone — exiting.")
         return
 
-    # Compact variants: if both Worldstone Keep and World Stone Keep matched, show once
-    canonical_map = {
-        "worldstone keep": "Worldstone Keep",
+    # Normalize a couple of variants for display (doesn't change matching)
+    canonical = {
         "world stone keep": "Worldstone Keep",
-        "secret cow level": "Secret Cow Level",
+        "worldstone keep": "Worldstone Keep",
         "cow level": "Secret Cow Level",
         "cows": "Secret Cow Level",
     }
-    display_hits = []
-    used = set()
+    display = []
+    seen = set()
     for h in hits:
-        key = canonical_map.get(h.lower(), h)
-        key_l = key.lower()
-        if key_l not in used:
-            used.add(key_l)
-            display_hits.append(key)
+        c = canonical.get(h.lower(), h)
+        if c.lower() not in seen:
+            seen.add(c.lower())
+            display.append(c)
 
     mention = f"<@&{ROLE_ID}>" if ROLE_ID else ""
     now_utc = datetime.now(timezone.utc)
-
     if should_send(now_utc):
         send_discord(
-            f"{mention} **Watched TZ detected (NEXT):** {', '.join(display_hits)}\n"
+            f"{mention} **Watched TZ detected (NEXT):** {', '.join(display)}\n"
             f"Source: {URL}"
         )
     else:
-        print(f"Match found ({', '.join(display_hits)}) but not a send minute "
+        print(f"Match found ({', '.join(display)}) but not a send minute "
               f"({now_utc.minute}). FORCE={FORCE}")
 
 if __name__ == "__main__":
