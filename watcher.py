@@ -11,6 +11,7 @@ DEBUG = os.environ.get("DEBUG", "0") in {"1", "true", "True"}
 
 _default_terms = ["Burial Grounds", "Crypt", "Mausoleum", "Far Oasis"]
 WATCH_TERMS = [t.strip() for t in os.environ.get("WATCH_TERMS", ",".join(_default_terms)).split(",") if t.strip()]
+WATCH_TERMS_LC = {t.lower() for t in WATCH_TERMS}
 
 SEND_MINUTES = {5, 30, 45, 55}
 URL = "https://d2emu.com/tz"
@@ -34,22 +35,50 @@ def fetch_html_requests() -> str:
     r.raise_for_status()
     return r.text
 
-def fetch_html_playwright() -> str:
-    # Lazy import so Actions without Playwright install won’t crash unless needed
+def fetch_dom_block_playwright() -> tuple[str | None, list[str]]:
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page()
         page.set_default_timeout(20000)
         page.goto(URL, wait_until="domcontentloaded")
-        # Give any client-side rendering a brief moment
         page.wait_for_timeout(1500)
-        html = page.content()
+
+        # Find the node that *visually* contains "Next Terror Zone:"
+        # then walk up to a reasonable container and pull text + link texts.
+        result = page.evaluate(
+            """
+            () => {
+              const matchText = (el) => (el && el.innerText || '').toLowerCase().includes('next terror zone');
+              const all = Array.from(document.querySelectorAll('body *'));
+              const anchor = all.find(el => matchText(el));
+              if (!anchor) return null;
+              let node = anchor;
+              for (let i=0; i<6 && node; i++) {
+                const text = (node.innerText || '').trim();
+                const links = Array.from(node.querySelectorAll('a'))
+                                   .map(a => (a.innerText || '').trim())
+                                   .filter(Boolean);
+                if (text) return { text, links };
+                node = node.parentElement;
+              }
+              return null;
+            }
+            """
+        )
         browser.close()
-        return html
+
+        if not result:
+            return None, []
+
+        # normalize whitespace
+        text = re.sub(r"[ \t]+", " ", result["text"])
+        text = re.sub(r"\n+", "\n", text).strip()
+        links = [s for s in result.get("links", []) if s]
+        return text, links
 
 def parse_next_timestamp(section: str, tz: ZoneInfo) -> datetime | None:
-    m = re.search(r"(\d{2}/\d{2}/\d{4}),\s*(\d{2}:\d{2}:\d{2})", section)
+    m = re.search(r"(\d{1,2}/\d{1,2}/\d{4}),\s*(\d{1,2}:\d{2}:\d{2})", section)
     if not m:
         return None
     d, t = m.group(1), m.group(2)
@@ -61,9 +90,15 @@ def parse_next_timestamp(section: str, tz: ZoneInfo) -> datetime | None:
             continue
     return None
 
-def find_hits(section: str) -> list[str]:
-    low = section.lower()
-    return sorted([t for t in WATCH_TERMS if t.lower() in low], key=lambda s: s.lower())
+def match_hits(section_text: str, nearby_links: list[str]) -> list[str]:
+    candidates = set([s.lower() for s in nearby_links]) | set(section_text.lower().split())
+    # Prefer exact link matches first, then fallback to substring in section text
+    hits = {t for t in WATCH_TERMS_LC if any(t == link.lower() for link in nearby_links)}
+    if not hits:
+        # substring fallback on whole block text
+        hits = {t for t in WATCH_TERMS_LC if t in section_text.lower()}
+    # return in display case
+    return [t for t in WATCH_TERMS if t.lower() in hits]
 
 def should_send_now(now_local: datetime, force: bool) -> bool:
     return force or (now_local.minute in SEND_MINUTES)
@@ -87,44 +122,41 @@ def main():
     force = os.environ.get("FORCE_SEND", "").lower() in {"1", "true", "yes"}
     tz = ZoneInfo(LOCAL_TZ)
 
-    def try_once(fetcher_name: str, html: str):
-        section = _section_from_html(html)
-        if DEBUG:
-            print(f"[DEBUG] Using {fetcher_name}. Found section: {section is not None}")
-            if section:
-                print("----- SECTION START -----")
-                print(section)
-                print("------ SECTION END ------")
-        if not section:
-            return None, None, None
-        hits = find_hits(section)
-        start_dt_local = parse_next_timestamp(section, tz)
-        return section, hits, start_dt_local
-
-    # 1) Try plain requests
+    # First try: plain requests (fast)
     html = fetch_html_requests()
-    section, hits, start_dt_local = try_once("requests", html)
+    section = _section_from_html(html)
+    links = []
+    if DEBUG:
+        print(f"[DEBUG] requests section found: {bool(section)}")
+        if section:
+            print("----- SECTION (requests) -----")
+            print(section)
+            print("----- END SECTION -----")
 
-    # 2) If we failed to find a section or hits, try Playwright render
-    if not section or (section and not hits):
+    # If that didn't include the zone names, render & grab DOM block + links
+    if section is None or True:  # always try DOM so we can get links reliably
         if DEBUG:
-            print("[DEBUG] Falling back to Playwright…")
-        try:
-            html2 = fetch_html_playwright()
-            section2, hits2, start_dt_local2 = try_once("playwright", html2)
-            # Prefer the successful Playwright parse
-            if section2:
-                section, hits, start_dt_local = section2, hits2, start_dt_local2
-        except Exception as e:
-            print(f"[DEBUG] Playwright fetch failed: {e}")
+            print("[DEBUG] Falling back to Playwright DOM extraction…")
+        sec2, links2 = fetch_dom_block_playwright()
+        if sec2:
+            section = sec2
+            links = links2
+            if DEBUG:
+                print(f"[DEBUG] playwright section ok: {bool(section)} links: {links}")
+                print("----- SECTION (playwright) -----")
+                print(section)
+                print("----- END SECTION -----")
 
-    # Final decision
     if not section:
         print("Could not extract Next Terror Zone section — exiting.")
         return
+
+    hits = match_hits(section, links)
     if not hits:
         print("No watched terms in Next Terror Zone — exiting.")
         return
+
+    start_dt_local = parse_next_timestamp(section, tz)
     if not start_dt_local:
         print("Could not parse timestamp; skipping send to avoid wrong times.")
         return
