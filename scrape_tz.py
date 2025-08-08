@@ -4,6 +4,7 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
 import json
 import pathlib
+import time
 
 # ----- Config -----
 WATCHLIST = {
@@ -29,43 +30,42 @@ def save_cache(data):
 
 # ----- Discord helpers -----
 def webhook_url_with_wait():
-    # Ensure we get JSON back (message id) by using ?wait=true
     if "?" in WEBHOOK_URL:
         return WEBHOOK_URL if "wait=true" in WEBHOOK_URL else WEBHOOK_URL + "&wait=true"
     return WEBHOOK_URL + "?wait=true"
 
 def webhook_base_url():
-    # For deletes: strip querystring
     return WEBHOOK_URL.split("?")[0].rstrip("/")
 
 def delete_message_by_id(message_id: str) -> bool:
-    """Delete a specific webhook message. Returns True if deleted or already gone (404)."""
     if not message_id:
         return False
     url = f"{webhook_base_url()}/messages/{message_id}"
     try:
         resp = requests.delete(url, timeout=10)
         if resp.status_code == 204:
-            print(f"Deleted message ID: {message_id}")
             return True
-        else:
-            # 404 means it's already gone (manual delete etc.) — treat as success
-            print(f"Delete failed ({resp.status_code}): {resp.text[:200]}")
-            return resp.status_code == 404
-    except Exception as e:
-        print(f"Error deleting message: {e}")
+        return resp.status_code == 404  # treat not found as "deleted"
+    except Exception:
         return False
 
 def send_discord_message(message: str) -> str | None:
-    """Send a message and return its id (requires ?wait=true)."""
     resp = requests.post(webhook_url_with_wait(), json={"content": message}, timeout=15)
     resp.raise_for_status()
-    data = resp.json()
-    return data.get("id")
+    return resp.json().get("id")
 
 # ----- Scraper -----
-def get_current_and_next():
-    """Return (current_zone, next_zone) from diablo2.io tracker."""
+def scrape_current_and_next(retries=2, delay=5):
+    """Try scraping current/next, retry if next is None."""
+    for attempt in range(retries + 1):
+        current_zone, next_zone = _scrape_once()
+        if next_zone:
+            return current_zone, next_zone
+        if attempt < retries:
+            time.sleep(delay)
+    return current_zone, next_zone
+
+def _scrape_once():
     url = "https://diablo2.io/tzonetracker.php"
     resp = requests.get(url, timeout=15)
     resp.raise_for_status()
@@ -95,13 +95,13 @@ def get_current_and_next():
 # ----- Time helpers -----
 def next_hour_utc():
     now = datetime.now(timezone.utc)
-    return (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
+    return now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
 
 def minutes_until(dt):
     now = datetime.now(timezone.utc)
     return int((dt - now).total_seconds() // 60)
 
-# ----- Messaging (alerts) -----
+# ----- Message builders -----
 ZONE_THEME = {
     "Worldstone Keep": {"header": "⚔️🔥", "initial_tail": "Prepare yourselves for the onslaught"},
     "Chaos Sanctuary": {"header": "😈🔥", "initial_tail": "Diablo stirs..."},
@@ -110,12 +110,13 @@ ZONE_THEME = {
 }
 GENERIC_THEME = {"header": "⚔️🔥", "initial_tail": "Prepare yourselves"}
 
-def build_alert_message(zone: str, stage: str, epoch: int) -> str:
-    """
-    Two-line alert:
-      Line 1: H1 header with themed emojis + zone name
-      Line 2: Role ping + stage text + Discord relative/absolute time
-    """
+def build_info_message(current_zone, current_end_epoch, next_zone, next_start_epoch):
+    header = "# 🕒 Terror Zone Status"
+    cur_block = f"## ⏳ Current\n**{current_zone or 'TBD'}** — ends <t:{current_end_epoch}:R>"
+    nxt_block = f"## 🔮 Next\n**{next_zone or 'TBD'}** — starts @ <t:{next_start_epoch}:t>"
+    return f"{header}\n\n{cur_block}\n\n{nxt_block}"
+
+def build_alert_message(zone, stage, epoch):
     theme = ZONE_THEME.get(zone, GENERIC_THEME)
     h = theme["header"]
     header_line = f"# {h} {zone} {h}"
@@ -143,21 +144,8 @@ def build_alert_message(zone: str, stage: str, epoch: int) -> str:
 
     return f"{header_line}\n{timing_line}"
 
-# ----- Messaging (info post) -----
-def build_info_message(current_zone: str | None, current_end_epoch: int, next_zone: str | None, next_start_epoch: int) -> str:
-    """
-    Big title, then distinct sections with icons:
-    - ⏳ Current: bold zone name + relative countdown
-    - 🔮 Next: bold zone name + absolute time
-    """
-    header = "# 🕒 Terror Zone Status"
-    cur_block = f"## ⏳ Current\n**{current_zone or 'Unknown'}** — ends <t:{current_end_epoch}:R>"
-    nxt_block = f"## 🔮 Next\n**{next_zone or 'Unknown'}** — starts @ <t:{next_start_epoch}:t>"
-    return f"{header}\n\n{cur_block}\n\n{nxt_block}"
-
 # ----- Stage logic -----
-def determine_stage(mins_to_hour: int) -> str:
-    # :05 (~55m), :30 (~30m), :45 (~15m), :55 (~5m)
+def determine_stage(mins_to_hour):
     if mins_to_hour >= 50:
         return "initial"
     if 26 <= mins_to_hour <= 35:
@@ -166,43 +154,23 @@ def determine_stage(mins_to_hour: int) -> str:
         return "15min"
     if 3 <= mins_to_hour <= 7:
         return "5min"
-    return "outside_window"
-
-def truthy_env(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+    return None
 
 # ----- Main -----
 def main():
     cache = load_cache()
 
-    # Demo mode: post initial alerts for ALL watchlist zones (no deletes/cache/windows)
-    if truthy_env("SEND_ALL_INITIALS"):
-        start_dt = next_hour_utc()
-        epoch = int(start_dt.timestamp())
-        print("SEND_ALL_INITIALS enabled — posting initial messages for all watchlist zones.")
-        for zone in WATCHLIST:
-            msg = build_alert_message(zone, "initial", epoch)
-            message_id = send_discord_message(msg)
-            print(f"Posted demo initial for {zone} (ID: {message_id})")
-        return
-
-    # Scrape both Current and Next
-    current_zone, next_zone = get_current_and_next()
-    if not next_zone and not current_zone:
-        print("Could not find current/next zones.")
-        return
+    # Scrape (with retry if next missing)
+    current_zone, next_zone = scrape_current_and_next()
 
     next_start_dt = next_hour_utc()
     mins_to_next = minutes_until(next_start_dt)
     epoch_next = int(next_start_dt.timestamp())
-    epoch_current_end = epoch_next  # current ends when next starts
+    epoch_current_end = epoch_next
 
-    print(f"Current: {current_zone or 'Unknown'} | Next: {next_zone or 'Unknown'} "
-          f"| Next starts at {next_start_dt.isoformat()} (~{mins_to_next} minutes)")
+    print(f"Current: {current_zone} | Next: {next_zone} | {mins_to_next} mins to next")
 
-    force = truthy_env("FORCE_DISCORD")
-
-    # ===== INFO POST (recover/update every run if missing/changed) =====
+    # --- INFO POST ---
     needs_info_update = (
         not cache.get("last_info_message_id")
         or cache.get("last_info_current_zone") != current_zone
@@ -210,61 +178,38 @@ def main():
     )
 
     if needs_info_update:
-        info_msg = build_info_message(current_zone, epoch_current_end, next_zone, epoch_next)
         if cache.get("last_info_message_id"):
-            if delete_message_by_id(cache["last_info_message_id"]):
-                cache["last_info_message_id"] = None
+            delete_message_by_id(cache["last_info_message_id"])
+        info_msg = build_info_message(current_zone, epoch_current_end, next_zone, epoch_next)
         new_info_id = send_discord_message(info_msg)
-        print(f"Posted/Updated info status (ID: {new_info_id})")
         cache["last_info_message_id"] = new_info_id
         cache["last_info_current_zone"] = current_zone
         cache["last_info_next_zone"] = next_zone
         save_cache(cache)
+        print(f"Info post updated (ID: {new_info_id})")
 
-    # ===== ALERTS =====
+    # --- ALERTS ---
     stage = determine_stage(mins_to_next)
-
-    # At :05, if next not in watchlist, delete last alert & skip
-    if not force and next_zone not in WATCHLIST and stage == "initial":
-        print("Next zone not in watchlist at :05 — deleting last alert and skipping pings.")
-        last_alert_id = cache.get("last_alert_message_id")
-        if last_alert_id:
-            if delete_message_by_id(last_alert_id):
-                cache["last_alert_message_id"] = None
-                save_cache(cache)
+    if not stage:
         return
 
-    if not force and stage == "outside_window":
-        print("Not at a scheduled alert checkpoint.")
+    if next_zone not in WATCHLIST:
         return
 
-    if next_zone not in WATCHLIST and not force:
-        print("Next zone not in watchlist — no alert.")
-        return
+    cache_key = f"{next_zone}_{stage}"
+    if cache.get(cache_key):
+        return  # already sent this stage
 
-    cache_key = f"{(next_zone or 'Unknown')}_{stage}"
-    if not force and cache.get(cache_key):
-        print("Already alerted for this stage.")
-        return
+    # delete last alert if exists
+    if cache.get("last_alert_message_id"):
+        delete_message_by_id(cache["last_alert_message_id"])
 
-    if force:
-        print("FORCE_DISCORD set — sending alert regardless of window or cache.")
-
-    # Replace the previous alert message
-    last_alert_id = cache.get("last_alert_message_id")
-    if last_alert_id:
-        if delete_message_by_id(last_alert_id):
-            cache["last_alert_message_id"] = None
-            save_cache(cache)
-
-    effective_stage = "initial" if (force and stage == "outside_window") else stage
-    alert_msg = build_alert_message(next_zone or "Unknown", effective_stage, epoch_next)
+    alert_msg = build_alert_message(next_zone, stage, epoch_next)
     new_alert_id = send_discord_message(alert_msg)
-    print(f"Sent alert (ID: {new_alert_id}) for stage '{effective_stage}':\n{alert_msg}")
-
     cache[cache_key] = True
     cache["last_alert_message_id"] = new_alert_id
     save_cache(cache)
+    print(f"Alert sent for {next_zone} ({stage})")
 
 if __name__ == "__main__":
     main()
