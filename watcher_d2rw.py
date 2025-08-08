@@ -1,4 +1,3 @@
-# watcher_d2rw.py
 import os
 import re
 import requests
@@ -6,10 +5,15 @@ from datetime import datetime, timezone
 
 URL = "https://d2runewizard.com/terror-zone-tracker"
 
+# --- Discord / config ---
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 ROLE_ID     = os.getenv("DISCORD_ROLE_ID", "").strip()
-WATCH_TERMS = os.getenv("WATCH_TERMS", "Burial Grounds,Crypt,Mausoleum,Far Oasis")
-WATCH = [t.strip() for t in WATCH_TERMS.split(",") if t.strip()]
+
+# If you want to override in repo vars, set WATCH_TERMS there.
+# Otherwise we default to your shortlist here.
+DEFAULT_WATCH = "Chaos Sanctuary,Worldstone Keep,World Stone Keep,Catacombs,Secret Cow Level,Cow Level,Cows"
+WATCH_TERMS = os.getenv("WATCH_TERMS", DEFAULT_WATCH)
+WATCH = [w.strip() for w in WATCH_TERMS.split(",") if w.strip()]
 
 DEBUG       = os.getenv("DEBUG", "false").lower() in {"1","true","yes"}
 FORCE       = os.getenv("FORCE_SEND", "false").lower() in {"1","true","yes"}
@@ -38,25 +42,6 @@ def send_discord(message: str):
     else:
         print("[INFO] Discord message sent.")
 
-def extract_next_block(html: str) -> str | None:
-    """
-    Grab everything from 'Next Terror Zone' up to either 'Current Terror Zone'
-    or the end of the main content. Works even if tags/classes change.
-    """
-    m = re.search(
-        r"(Next\s*Terror\s*Zone.*?)(?:Current\s*Terror\s*Zone|</main>|</body>|$)",
-        html,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if not m:
-        return None
-    return m.group(1)
-
-def find_hits_in_block(block: str) -> list[str]:
-    low = block.lower()
-    hits = [w for w in WATCH if w.lower() in low]
-    return sorted(set(hits), key=lambda x: low.find(x.lower()))
-
 def main():
     if not WEBHOOK_URL:
         print("[CONFIG ERROR] DISCORD_WEBHOOK_URL is not set.")
@@ -73,36 +58,62 @@ def main():
     resp.raise_for_status()
     html = resp.text
 
-    block = extract_next_block(html)
-    if block is None:
-        print("Error: Could not find the 'Next Terror Zone' block.")
+    # Find the "Next Terror Zone" heading, then scan forward from there
+    idx_next = html.lower().find("next terror zone")
+    if idx_next == -1:
+        print("Error: Could not find the 'Next Terror Zone' text.")
         if DEBUG:
-            print("[DEBUG] HTML preview:", html[:1200])
+            print("[DEBUG] HTML preview:", html[:1000])
         return
 
+    # Take a generous forward slice (names should be in here)
+    forward = html[idx_next: idx_next + 50000]  # plenty of room
     if DEBUG:
-        preview = re.sub(r"\s+", " ", block)[:600]
-        print(f"[DEBUG] Next block preview: {preview}")
+        prev = re.sub(r"\s+", " ", forward[:800])
+        print(f"[DEBUG] Next-section preview: {prev}")
 
-    hits = find_hits_in_block(block)
+    # Look for any watch term inside this forward slice
+    low = forward.lower()
+    hits = []
+    for term in WATCH:
+        if term.lower() in low:
+            hits.append(term)
+
+    # Deduplicate but keep order of first appearance
+    seen = set()
+    hits = [h for h in hits if not (h.lower() in seen or seen.add(h.lower()))]
+
     if not hits:
         print("No watched zones in Next Terror Zone — exiting.")
         return
 
-    mention = f"<@&{ROLE_ID}>" if ROLE_ID else ""
-    when = "(time not provided on this page)"
-    # If the page ever exposes a next timestamp later, we can add parsing here.
+    # Compact variants: if both Worldstone Keep and World Stone Keep matched, show once
+    canonical_map = {
+        "worldstone keep": "Worldstone Keep",
+        "world stone keep": "Worldstone Keep",
+        "secret cow level": "Secret Cow Level",
+        "cow level": "Secret Cow Level",
+        "cows": "Secret Cow Level",
+    }
+    display_hits = []
+    used = set()
+    for h in hits:
+        key = canonical_map.get(h.lower(), h)
+        key_l = key.lower()
+        if key_l not in used:
+            used.add(key_l)
+            display_hits.append(key)
 
+    mention = f"<@&{ROLE_ID}>" if ROLE_ID else ""
     now_utc = datetime.now(timezone.utc)
+
     if should_send(now_utc):
         send_discord(
-            f"{mention} **Watched TZ detected!**\n"
-            f"**Next zones:** {', '.join(hits)}\n"
-            f"{when}\n"
+            f"{mention} **Watched TZ detected (NEXT):** {', '.join(display_hits)}\n"
             f"Source: {URL}"
         )
     else:
-        print(f"Match found ({', '.join(hits)}) but not a send minute "
+        print(f"Match found ({', '.join(display_hits)}) but not a send minute "
               f"({now_utc.minute}). FORCE={FORCE}")
 
 if __name__ == "__main__":
