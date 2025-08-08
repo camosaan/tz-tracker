@@ -183,19 +183,29 @@ def main():
 
     force = truthy_env("FORCE_DISCORD")
 
-    stage_guess = determine_stage(mins_to_next)
-    if stage_guess == "initial" or force:
+    # ===== INFO POST CHECK (every run) =====
+    needs_info_update = (
+        not cache.get("last_info_message_id")
+        or cache.get("last_info_current_zone") != current_zone
+        or cache.get("last_info_next_zone") != next_zone
+    )
+
+    if needs_info_update:
         info_msg = build_info_message(current_zone, epoch_current_end, next_zone, epoch_next)
-        last_info_id = cache.get("last_info_message_id")
-        if last_info_id:
-            if delete_message_by_id(last_info_id):
+        if cache.get("last_info_message_id"):
+            if delete_message_by_id(cache["last_info_message_id"]):
                 cache["last_info_message_id"] = None
         new_info_id = send_discord_message(info_msg)
-        print(f"Posted info status (ID: {new_info_id})")
+        print(f"Posted/Updated info status (ID: {new_info_id})")
         cache["last_info_message_id"] = new_info_id
+        cache["last_info_current_zone"] = current_zone
+        cache["last_info_next_zone"] = next_zone
         save_cache(cache)
 
-    if not force and next_zone not in WATCHLIST and stage_guess == "initial":
+    # ===== ALERT LOGIC =====
+    stage = determine_stage(mins_to_next)
+
+    if not force and next_zone not in WATCHLIST and stage == "initial":
         print("Next zone not in watchlist at :05 — deleting last alert and skipping pings.")
         last_alert_id = cache.get("last_alert_message_id")
         if last_alert_id:
@@ -204,7 +214,6 @@ def main():
                 save_cache(cache)
         return
 
-    stage = determine_stage(mins_to_next)
     if not force and stage == "outside_window":
         print("Not at a scheduled alert checkpoint.")
         return
