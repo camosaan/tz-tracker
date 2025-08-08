@@ -2,8 +2,11 @@ name: Terror Zone Alerts
 
 on:
   schedule:
-    - cron: "*/5 * * * *" # every 5 minutes
-  workflow_dispatch: # allow manual runs
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write  # <-- allow pushes
 
 jobs:
   scrape:
@@ -11,6 +14,9 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # needed to push back
+          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -30,3 +36,5 @@ jobs:
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "Update TZ alert cache"
+          token: ${{ secrets.GITHUB_TOKEN }}   # explicit (usually implicit, but safe)
+          branch: ${{ github.ref_name }}       # push to current branch
