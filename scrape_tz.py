@@ -75,6 +75,9 @@ def main():
     mins = minutes_until(start_dt)
     epoch = int(start_dt.timestamp())
 
+    # Local time for absolute display
+    local_time_str = start_dt.astimezone().strftime("%-I:%M %p")
+
     print(f"Next zone: {zone}, starts at {start_dt.isoformat()} (~{mins} minutes)")
 
     force = os.environ.get("FORCE_DISCORD", "").lower() in ("1", "true", "yes")
@@ -104,14 +107,13 @@ def main():
     else:
         print("FORCE_DISCORD flag set — sending alert regardless of window or cache.")
 
-    # Build message with bold zone name and Discord timestamps
-    message = (
-        f"<@&{ROLE_ID}> **{zone}** up next <t:{epoch}:R> "
-        f"(at <t:{epoch}:t>)."
-    )
+    # Build fancy message with header + timing
+    header_line = f"# ⚔️🔥 {zone} 🔥⚔️"
+    timing_line = f"<@&{ROLE_ID}> up next <t:{epoch}:R> @ {local_time_str}"
+    message = f"{header_line}\n{timing_line}"
 
     send_discord_message(message)
-    print(f"Sent alert: {message}")
+    print(f"Sent alert:\n{message}")
 
     cache[cache_key] = True
     save_cache(cache)
