@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "*/5 * * * *"   # every 5 minutes
   workflow_dispatch:        # allow manual runs
+    inputs:
+      force_discord:
+        description: "Force Discord ping (ignore cache)"
+        required: false
+        type: boolean
 
 permissions:
   contents: write           # allow commits to repo
@@ -29,12 +34,24 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DISCORD_ROLE_ID: ${{ secrets.DISCORD_ROLE_ID }}
+          FORCE_DISCORD: ${{ github.event.inputs.force_discord }}
         run: python scrape_tz.py
 
+      - name: Check if cache changed
+        id: cache_check
+        run: |
+          if git diff --quiet tz_alert_cache.json; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
       - name: Stage cache file
+        if: steps.cache_check.outputs.changed == 'true'
         run: git add tz_alert_cache.json
 
       - name: Save cache
+        if: steps.cache_check.outputs.changed == 'true'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "Update TZ alert cache"
