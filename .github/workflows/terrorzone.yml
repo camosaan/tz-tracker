@@ -8,9 +8,14 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: terrorzone-scraper
+  cancel-in-progress: true
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -31,9 +36,9 @@ jobs:
           DISCORD_ROLE_ID: ${{ secrets.DISCORD_ROLE_ID }}
         run: python scrape_tz.py
 
-      # Only commit tz_alert_cache.json when it actually changed
       - name: Detect cache change
         id: cachecheck
+        shell: bash
         run: |
           if [ -f tz_alert_cache.json ]; then
             git add tz_alert_cache.json
@@ -44,6 +49,7 @@ jobs:
             fi
           else
             echo "changed=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Commit cache
         if: steps.cachecheck.outputs.changed == 'true'
