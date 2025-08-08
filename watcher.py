@@ -1,11 +1,12 @@
-import os, re, sys
-from datetime import datetime
+import os, re, sys, base64
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import requests
+from bs4 import BeautifulSoup
 
-# ---------- Config via env ----------
+# --------- Env config ----------
 WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
-ROLE_ID = os.environ["DISCORD_ROLE_ID"]  # role to mention
+ROLE_ID = os.environ["DISCORD_ROLE_ID"]        # Discord role id to ping
 LOCAL_TZ = os.environ.get("LOCAL_TZ", "Europe/London")
 DEBUG = os.environ.get("DEBUG", "0").lower() in {"1", "true", "yes"}
 FORCE = os.environ.get("FORCE_SEND", "false").lower() in {"1", "true", "yes"}
@@ -14,103 +15,75 @@ DEFAULT_TERMS = ["Burial Grounds", "Crypt", "Mausoleum", "Far Oasis"]
 WATCH_TERMS = [t.strip() for t in os.environ.get("WATCH_TERMS", ",".join(DEFAULT_TERMS)).split(",") if t.strip()]
 WATCH_TERMS_LC = {t.lower() for t in WATCH_TERMS}
 
-# Send at these local minutes: :05 (initial), then :30, :45, :55
+# Send at :05 (initial), then :30, :45, :55 local time
 SEND_MINUTES = {5, 30, 45, 55}
 
 URL = "https://d2emu.com/tz"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-GB,en;q=0.9",
+}
 
 
-# ---------- Playwright extraction (robust) ----------
-def fetch_next_tz_playwright() -> tuple[str | None, list[str]]:
+def fetch_html() -> str:
+    r = requests.get(URL, headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    return r.text
+
+
+def parse_next_epoch_and_blob(html: str) -> tuple[datetime | None, str | None]:
     """
-    Find a container that contains the text 'Next Terror Zone' AND at least one UL>LI>A link.
-    Return (container_text, [zone names]).
+    Extract:
+      - next start time from  <div id="next-time" value=EPOCH>
+      - base64 zone list from <span class="terrorzone" id="__2" value="...">
+    The base64 decodes to a multilingual JSON-ish string that *contains* the zone names.
+    We don't need to parse JSON – just substring-match the decoded text.
     """
-    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    soup = BeautifulSoup(html, "html.parser")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page(
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")),
-        page = page[0]  # new_page returns a tuple in some wrappers; take the first
-
-        # Be a little more “browser-like”
-        page.set_extra_http_headers({
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-GB,en;q=0.9",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-        })
-        page.set_default_timeout(30000)
-        page.goto(URL, wait_until="load")
-        page.wait_for_timeout(2000)  # small settle time
-
-        # How many anchors exist?
+    # 1) Epoch time
+    epoch_div = soup.find(id="next-time")
+    start_local = None
+    if epoch_div and epoch_div.has_attr("value"):
         try:
-            anchor_count = page.locator("text=Next Terror Zone").count()
+            epoch = int(str(epoch_div["value"]).strip())
+            # epoch is seconds since UTC; convert to your LOCAL_TZ
+            start_local = datetime.fromtimestamp(epoch, tz=timezone.utc).astimezone(ZoneInfo(LOCAL_TZ))
         except Exception:
-            anchor_count = 0
-        if DEBUG:
-            print(f"[DEBUG] anchors with 'Next Terror Zone': {anchor_count}")
+            start_local = None
 
-        # Choose any DIV that has the text *and* has UL LI A links inside
-        container = page.locator("css=div", has_text="Next Terror Zone").filter(
-            has=page.locator("css=ul li a")
-        ).first
+    # 2) Base64 blob with zone names for the NEXT block (id="__2")
+    blob = None
+    span_next = soup.find("span", {"class": "terrorzone", "id": "__2"})
+    if span_next and span_next.has_attr("value"):
+        blob = str(span_next["value"]).strip()
 
-        try:
-            container.wait_for(state="attached", timeout=6000)
-        except PWTimeout:
-            if DEBUG:
-                # Give us something to diagnose
-                try:
-                    body_text = page.locator("body").inner_text()[:700]
-                except Exception:
-                    body_text = "<no body text>"
-                print("[DEBUG] No suitable container; body preview:")
-                print(body_text)
-            browser.close()
-            return None, []
+    if DEBUG:
+        print(f"[DEBUG] epoch found: {start_local is not None} value={epoch_div['value'] if epoch_div and epoch_div.has_attr('value') else 'None'}")
+        print(f"[DEBUG] blob present: {blob is not None}")
+        if blob:
+            try:
+                preview = base64.b64decode(blob.encode("utf-8"), validate=False).decode("utf-8", errors="ignore")
+                print("[DEBUG] decoded blob preview >>>")
+                print(preview[:700])
+                print("<<< end preview")
+            except Exception as e:
+                print(f"[DEBUG] base64 decode failed: {e}")
 
-        # Full text of the container (for timestamp parsing)
-        try:
-            block_text = container.inner_text().strip()
-        except Exception:
-            block_text = ""
-
-        # All zone names (links) in that same container
-        try:
-            zones = [t.strip() for t in container.locator("css=ul li a").all_inner_texts() if t.strip()]
-        except Exception:
-            zones = []
-
-        if DEBUG:
-            print("[DEBUG] block snippet >>>")
-            print(block_text[:700])
-            print("<<< block snippet end")
-            print(f"[DEBUG] zones: {zones}")
-
-        browser.close()
-        return (block_text if block_text else None), zones
+    return start_local, blob
 
 
-# ---------- helpers ----------
-def parse_next_timestamp(block_text: str, tz: ZoneInfo) -> datetime | None:
-    """
-    Extract 'DD/MM/YYYY, HH:MM:SS' or 'M/D/YYYY, HH:MM:SS' from the text and attach tz.
-    """
-    m = re.search(r"(\d{1,2}/\d{1,2}/\d{4}),\s*(\d{1,2}:\d{2}:\d{2})", block_text or "")
-    if not m:
-        return None
-    d, t = m.group(1), m.group(2)
-    for fmt in ("%d/%m/%Y, %H:%M:%S", "%m/%d/%Y, %H:%M:%S"):
-        try:
-            dt_naive = datetime.strptime(f"{d}, {t}", fmt)
-            return dt_naive.replace(tzinfo=tz)
-        except ValueError:
-            continue
-    return None
+def decode_blob(blob: str) -> str:
+    try:
+        return base64.b64decode(blob.encode("utf-8"), validate=False).decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def find_hits(decoded_text: str) -> list[str]:
+    low = decoded_text.lower()
+    return [t for t in WATCH_TERMS if t.lower() in low]
 
 
 def should_send_now(now_local: datetime) -> bool:
@@ -118,10 +91,9 @@ def should_send_now(now_local: datetime) -> bool:
 
 
 def send_webhook(zones: list[str], start_dt_local: datetime, context_text: str):
-    # Discord auto-localized time tags
     epoch = int(start_dt_local.timestamp())
-    abs_tag = f"<t:{epoch}:t>"
-    rel_tag = f"<t:{epoch}:R>"
+    abs_tag = f"<t:{epoch}:t>"   # absolute local time for each user
+    rel_tag = f"<t:{epoch}:R>"   # relative time, e.g., "in 15 minutes"
 
     mention = f"<@&{ROLE_ID}>"
     zone_names = ", ".join(zones)
@@ -131,42 +103,41 @@ def send_webhook(zones: list[str], start_dt_local: datetime, context_text: str):
         f"Starts at {abs_tag} ({rel_tag})\n"
         f"Source: {URL}"
     )
-    snippet = "```\n" + (context_text[:1700] if context_text else "") + "\n```"
 
-    r = requests.post(WEBHOOK_URL, json={"content": content + "\n" + snippet}, timeout=20)
+    # Keep a small snippet for visibility/debug
+    snippet = "```\n" + context_text[:1500] + "\n```" if context_text else ""
+    r = requests.post(WEBHOOK_URL, json={"content": content + ("\n" + snippet if snippet else "")}, timeout=20)
     r.raise_for_status()
 
 
-# ---------- main ----------
 def main():
     tz = ZoneInfo(LOCAL_TZ)
+    html = fetch_html()
 
-    block_text, zones = fetch_next_tz_playwright()
-    if DEBUG:
-        print(f"[DEBUG] block_text present: {bool(block_text)}")
-
-    if not block_text:
-        print("Could not locate the Next Terror Zone block — exiting.")
+    start_local, blob = parse_next_epoch_and_blob(html)
+    if not blob:
+        print("Could not find NEXT TZ zone list blob — exiting.")
+        return
+    if not start_local:
+        print("Could not parse next start time — exiting.")
         return
 
-    # Filter for watched zones (case-insensitive)
-    hits = [z for z in zones if z.lower() in WATCH_TERMS_LC]
+    decoded = decode_blob(blob)
     if DEBUG:
-        print(f"[DEBUG] hits after filter: {hits}")
+        print(f"[DEBUG] decoded length: {len(decoded)}")
+
+    hits = find_hits(decoded)
+    if DEBUG:
+        print(f"[DEBUG] hits: {hits}")
 
     if not hits:
         print("No watched terms in Next Terror Zone — exiting.")
         return
 
-    start_dt_local = parse_next_timestamp(block_text, tz)
-    if not start_dt_local:
-        print("Could not parse timestamp; skipping send to avoid wrong times.")
-        return
-
     now_local = datetime.now(tz)
     if should_send_now(now_local):
-        print(f"Sending at {now_local.isoformat()} hits={hits} start={start_dt_local.isoformat()} force={FORCE}")
-        send_webhook(hits, start_dt_local, block_text)
+        print(f"Sending at {now_local.isoformat()} hits={hits} start={start_local.isoformat()} force={FORCE}")
+        send_webhook(hits, start_local, decoded)
     else:
         print(f"Match present but not a send minute ({now_local.minute}). Skipping. force={FORCE}")
 
