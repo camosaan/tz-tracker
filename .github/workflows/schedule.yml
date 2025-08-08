@@ -1,4 +1,5 @@
-name: TZ Watcher (requests)
+name: TZ Watcher (requests brute-decoder)
+
 on:
   workflow_dispatch:
     inputs:
