@@ -107,7 +107,7 @@ def main():
     else:
         print("FORCE_DISCORD flag set — sending alert regardless of window or cache.")
 
-    # Build fancy message with header + timing
+    # Build single fancy message with header + timing
     header_line = f"# ⚔️🔥 {zone} 🔥⚔️"
     timing_line = f"<@&{ROLE_ID}> up next <t:{epoch}:R> @ {local_time_str}"
     message = f"{header_line}\n{timing_line}"
