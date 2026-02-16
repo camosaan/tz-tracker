@@ -1,0 +1,924 @@
+// BUILD: 2026-02-16 — cleaned + LIVE restored (banner-based), brief LIVE ping
+// Cloudflare Worker — Diablo 2 TZ tracker -> Discord
+// KV binding: TZ_KV
+// Secret (optional): DISCORD_WEBHOOK_URL  (may include ?thread_id=...)
+// Text var (optional): DISCORD_ROLE_ID
+// Cron: */5 * * * *
+
+/* ========================================================================== */
+/* ============================ SECTION: CONFIG START ======================== */
+/* ========================================================================== */
+
+// Discord policy
+const DISCORD_ATTEMPTS   = 3;        // up to 3 tries per op
+const DISCORD_TIMEOUT_MS = 10_000;   // per-call timeout
+
+// Scraper
+const SCRAPE_MAX_RETRIES = 4;
+const SCRAPE_BASE_DELAY  = 400;      // ms base backoff (scraper only)
+const SCRAPE_TIMEOUT_MS  = 12_000;   // per-call timeout
+const SCRAPE_URL = "https://www.diablo2.io/tzonetracker.php";
+
+// LIVE behavior
+const LIVE_DELETE_GRACE_S = 90;
+
+// Transient ping message (new message => real notification)
+const KV_LAST_PING_ID     = "last_ping_message_id";
+const KV_LAST_PING_EPOCH  = "last_ping_message_epoch";
+const PING_TTL_SECONDS = 6 * 60; // 6 minutes
+
+// Persistent message slots
+const KV_ANNOUNCE_ID = "persistent_announce_message_id"; // slot #1 (top)
+const KV_INFO_ID     = "persistent_info_message_id";     // slot #2 (bottom)
+
+/* ========================================================================== */
+/* ============================= SECTION: CONFIG END ========================= */
+/* ========================================================================== */
+
+
+/* ========================================================================== */
+/* ====================== SECTION: WATCHLIST & THEMING START ================= */
+/* ========================================================================== */
+
+const WATCH_CANON_MAP = new Map([
+  ["Worldstone Keep", "Baal"],
+  ["Chaos Sanctuary", "Diablo"],
+  ["The Secret Cow Level", "Moo Moo"],
+  ["Cathedral", "Andy"],
+  ["Tower Cellar", "The Countess"],
+  ["Nihlathak", "Nithilak"],
+
+  ["Tristram", "Tristram"],
+  ["Dry Hills", "Cubed"],
+  ["Lost City", "Lost City"],
+  ["Arcane Sanctuary", "Sanctuary"],
+  ["Tal Rasha's Tombs", "Duriel"],
+
+  ["Flayer Jungle", "Lala Jungle"],
+  ["Kurast Bazaar", "Kurast Tour"],
+  ["Travincal", "Money Council"],
+  ["Durance of Hate", "Meph"],
+
+  ["Bloody Foothills", "Dodgeball"],
+]);
+
+const ZONE_THEME = {
+  "Worldstone Keep":       { header: "⚔️🔥" },
+  "Chaos Sanctuary":       { header: "😈🔥" },
+  "The Secret Cow Level":  { header: "🐄🥛" },
+  "Cathedral":             { header: "🏰🕯️" },
+  "Tower Cellar":          { header: "🗼🗝️" },
+  "Nihlathak":             { header: "💀❄️" },
+
+  "Tristram":              { header: "🦵🔥" },
+  "Dry Hills":             { header: "🧊🗃️" },
+  "Lost City":             { header: "🏜️🦂" },
+  "Arcane Sanctuary":      { header: "🌀✨" },
+  "Tal Rasha's Tombs":     { header: "🐛❄️" },
+
+  "Flayer Jungle":         { header: "🌿🗡️" },
+  "Kurast Bazaar":         { header: "🛕🌿" },
+  "Travincal":             { header: "💰🗡️" },
+  "Durance of Hate":       { header: "🌊💀" },
+
+  "Bloody Foothills":      { header: "🏔️🏃" },
+};
+
+const GENERIC = { header: "⚔️🔥" };
+const themed = (canon) => ZONE_THEME[canon] || GENERIC;
+const reverseEmojis = (s) => [...s].reverse().join("");
+
+function displayFor(canon) {
+  const v = WATCH_CANON_MAP.get(canon);
+  return (v && v.trim()) ? v.trim() : canon;
+}
+
+/* ========================================================================== */
+/* ======================= SECTION: WATCHLIST & THEMING END ================== */
+/* ========================================================================== */
+
+
+/* ========================================================================== */
+/* =========================== SECTION: ZONE GROUPS START ==================== */
+/* ========================================================================== */
+
+const ZONE_GROUPS = [
+  // Act 1
+  ["Cold Plains", "Cave"],
+  ["Burial Grounds", "Crypt", "Mausoleum"],
+  ["Tristram", "Stony Field"],
+  ["Dark Wood", "Underground Passage"],
+  ["Tower Cellar", "Black Marsh", "Hole", "Forgotten Tower"],
+  ["Jail", "Barracks"],
+  ["Pit", "Tamoe Highland", "Outer Cloister"],
+  ["Cathedral", "Inner Cloister", "Catacombs"],
+  ["The Secret Cow Level", "Secret Cow Level"],
+
+  // Act 2
+  ["Sewers"],
+  ["Rocky Waste", "Stony Tomb"],
+  ["Dry Hills", "Halls of the Dead"],
+  ["Far Oasis", "Maggot Lair"],
+  ["Lost City", "Valley of Snakes", "Claw Viper Temple", "Ancient Tunnels"],
+  ["Arcane Sanctuary", "Harem", "Palace"],
+  ["Tal Rasha's Tombs", "Canyon of the Magi"],
+
+  // Act 3
+  ["Spider Forest", "Spider Cavern", "Arachnid Lair"],
+  ["Great Marsh"],
+  ["Flayer Jungle", "Flayer Dungeon", "Swampy Pit"],
+  ["Kurast Bazaar", "Ruined Temple", "Disused Fane", "Lower Kurast", "Upper Kurast", "Forgotten Temple", "Forgotten Reliquary", "Disused Reliquary", "Ruined Fane"],
+  ["Travincal"],
+  ["Durance of Hate"],
+
+  // Act 4
+  ["Outer Steppes", "Plains of Despair"],
+  ["River of Flame", "City of the Damned"],
+  ["Chaos Sanctuary"],
+
+  // Act 5
+  ["Bloody Foothills", "Frigid Highlands", "Abaddon"],
+  ["Glacial Trail", "Drifter Cavern"],
+  ["Crystalline Passage", "Frozen River"],
+  ["Frozen Tundra", "Infernal Pit"],
+  ["Arreat Plateau", "Pit of Acheron"],
+  ["Nihlathak", "Nihlathak's Temple", "Halls of Anguish", "Halls of Pain", "Halls of Vaught"],
+  ["Ancient's Way", "Icy Cellar"],
+  ["Worldstone Keep", "Throne of Destruction", "Worldstone Chamber"],
+];
+
+const ZONE_TO_GROUP_KEY = new Map();
+const GROUP_KEY_TO_MEMBERS = new Map();
+let GROUP_INDEX_BUILT = false;
+
+function normZoneName(s) {
+  return (s || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/\s*Level\s*\d+$/i, "");
+}
+
+function ensureGroupIndexes() {
+  if (GROUP_INDEX_BUILT) return;
+  GROUP_INDEX_BUILT = true;
+
+  for (const group of (ZONE_GROUPS || [])) {
+    if (!group?.length) continue;
+    const key = normZoneName(group[0]);
+    const members = group.map(normZoneName).filter(Boolean);
+    GROUP_KEY_TO_MEMBERS.set(key, members);
+    for (const z of members) ZONE_TO_GROUP_KEY.set(z, key);
+  }
+}
+
+function groupMembersForRawZone(rawZoneName) {
+  ensureGroupIndexes();
+  const z = normZoneName(rawZoneName);
+  if (!z) return [];
+  const key = ZONE_TO_GROUP_KEY.get(z);
+  return key ? (GROUP_KEY_TO_MEMBERS.get(key) || []) : [];
+}
+
+function groupMembersForCanonOrRaw(zoneCanon, rawZoneName) {
+  ensureGroupIndexes();
+  const canon = normZoneName(zoneCanon);
+  if (canon && GROUP_KEY_TO_MEMBERS.has(canon)) return GROUP_KEY_TO_MEMBERS.get(canon) || [];
+  return groupMembersForRawZone(rawZoneName);
+}
+
+function formatPoolInline(members, fallbackSingle) {
+  if (members && members.length) return members.join(", ");
+  return normZoneName(fallbackSingle) || "TBD";
+}
+
+function formatIncludesFootnote(members) {
+  if (!members || members.length <= 1) return "";
+  return `\n\n_Includes:_ ${members.join(", ")}`;
+}
+
+/* ========================================================================== */
+/* ============================ SECTION: ZONE GROUPS END ===================== */
+/* ========================================================================== */
+
+
+/* ========================================================================== */
+/* =========================== SECTION: ENTRYPOINTS START ==================== */
+/* ========================================================================== */
+
+export default {
+  async scheduled(_evt, env, ctx) { ctx.waitUntil(run(env)); },
+  async fetch(req, env) {
+    const url = new URL(req.url);
+    const debug = url.searchParams.get("debug") === "1";
+    const out = await run(env, debug);
+    return new Response(JSON.stringify(out, null, 2), {
+      headers: { "content-type": "application/json" },
+    });
+  },
+};
+
+/* ========================================================================== */
+/* ============================ SECTION: ENTRYPOINTS END ===================== */
+/* ========================================================================== */
+
+
+/* ========================================================================== */
+/* ============================== SECTION: MAIN START ======================== */
+/* ========================================================================== */
+
+async function run(env, debug = false) {
+  if (!env || !env.TZ_KV) throw new Error("Missing KV binding TZ_KV");
+  const kv = env.TZ_KV;
+
+  const { currentZone, nextZone, diag } =
+    await scrapeWithRetry(SCRAPE_MAX_RETRIES, SCRAPE_BASE_DELAY, debug);
+
+  const now = new Date();
+  const nowEpoch = Math.floor(now.getTime() / 1000);
+
+  // 30-minute TZ rotation: next boundary is the next :00 or :30 (UTC)
+  const utcY  = now.getUTCFullYear();
+  const utcMo = now.getUTCMonth();
+  const utcD  = now.getUTCDate();
+  const utcH  = now.getUTCHours();
+  const utcM  = now.getUTCMinutes();
+
+  const nextBoundary = (utcM < 30)
+    ? new Date(Date.UTC(utcY, utcMo, utcD, utcH, 30, 0, 0))
+    : new Date(Date.UTC(utcY, utcMo, utcD, utcH + 1, 0, 0, 0));
+
+  const epochNext  = Math.floor(nextBoundary.getTime() / 1000);
+  const minsToNext = Math.floor((nextBoundary - now) / 60000);
+
+  const canonCurrent = canonicalize(currentZone);
+  const canonNext    = canonicalize(nextZone);
+
+  // Always cleanup old transient ping message (so the channel stays tidy)
+  await cleanupStalePing(env, nowEpoch);
+
+  // Ensure the 2 persistent messages exist and are correctly ordered
+  const dashFramed  = frameAnnouncement(buildAnnouncementDashboard());
+  const infoContent = buildInfoMessage(currentZone, epochNext, nextZone, epochNext);
+  await ensurePersistentPair(env, dashFramed, infoContent);
+
+  // Keep the Info message current (persistent slot #2)
+  await ensureInfoMessage(env, { currentZone, nextZone, epochNext });
+
+  // Maintain LIVE banner (refresh while live; revert after end+grace)
+  await maintainLiveAlert(env, now);
+
+  // First-seen ping (once per hour per watched Next)
+  const nextDisplayName = canonNext ? displayFor(canonNext) : null;
+  if (canonNext && WATCH_CANON_MAP.has(canonNext) && nextDisplayName) {
+    await maybeAnnounceFirstSeen(env, {
+      zoneCanon: canonNext,
+      zoneDisplay: nextDisplayName,
+      startEpoch: epochNext,
+    });
+  }
+
+  // Timed stage pings (15/5) with KV de-dupe
+  const stage = stageFor(minsToNext);
+  if (stage && canonNext && WATCH_CANON_MAP.has(canonNext) && nextDisplayName) {
+    await ensureUpcomingAlert(env, {
+      zoneCanon: canonNext,
+      zoneDisplay: nextDisplayName,
+      startEpoch: epochNext,
+      stage,
+    });
+  }
+
+  // Promotion (UPCOMING -> LIVE) + broom for lingering upcoming
+  await maybePromoteUpcomingToLive(env, now, {
+    canonCurrentFromScrape: canonCurrent,
+    canonNextFromScrape: canonNext,
+  });
+
+  // If there's no LIVE and no UPCOMING state right now, keep the banner as the dashboard
+  const liveEndEpoch = parseInt(await kv.get("live_end_epoch") || "0", 10);
+  const hasLive = !!liveEndEpoch && nowEpoch <= (liveEndEpoch + LIVE_DELETE_GRACE_S);
+
+  const upStart = parseInt(await kv.get("upcoming_start_epoch") || "0", 10);
+  const hasUpcoming = !!upStart && nowEpoch < (upStart + 10 * 60);
+
+  if (!hasLive && !hasUpcoming) {
+    await patchAnnouncementSlot(env, frameAnnouncement(buildAnnouncementDashboard()));
+  }
+
+  return {
+    ok: true,
+    currentZone,
+    nextZone,
+    minsToNext,
+    stage,
+    diagnostics: debug ? diag : undefined,
+  };
+}
+
+/* ========================================================================== */
+/* =============================== SECTION: MAIN END ========================= */
+/* ========================================================================== */
+
+
+/* ========================================================================== */
+/* ===================== SECTION: ANNOUNCE/INFO CONTENT START ================ */
+/* ========================================================================== */
+
+function frameAnnouncement(content) {
+  const DIVIDER = "────────────────────────────────────────────────────────────";
+  return `${(content ?? "").trim()}\n\n${DIVIDER}`;
+}
+
+function buildAnnouncementDashboard() {
+  return [
+    "# 🗑️ Terror Zones are trash right now so why not try...",
+    "## 🔑 [Keys](https://maxroll.gg/d2/meta/ubers-explained#why-do-i-farm-hellfire-torches?-header) • 💰 [Trav](https://maxroll.gg/d2/meta/travincal-farming-guide) • 🐄 [Cows](https://maxroll.gg/d2/meta/the-secret-cow-level-farming-guide)",
+    "## 👑 [Baal](https://maxroll.gg/d2/meta/worldstone-keep-and-baal-farming-guide) • 😈 [Ubers](https://maxroll.gg/d2/meta/ubers-explained#why-do-i-farm-hellfire-torches?-header) • 🧪 [Craft](https://maxroll.gg/d2/items/crafted-items)",
+    "",
+  ].join("\n");
+}
+
+function buildInfoMessage(currentZone, epochCurrentEnd, nextZone, epochNextStart) {
+  const nowEpoch = Math.floor(Date.now() / 1000);
+
+  const curMembers = currentZone ? groupMembersForRawZone(currentZone) : [];
+  const nxtMembers = nextZone ? groupMembersForRawZone(nextZone) : [];
+
+  const curLabel = formatPoolInline(curMembers, currentZone);
+  const nxtLabel = formatPoolInline(nxtMembers, nextZone);
+
+  const currentLine = currentZone
+    ? `${curLabel} — ends <t:${epochCurrentEnd}:R>`
+    : "**Unknown**";
+
+  const nextLine = nextZone
+    ? `${nxtLabel} — starts @ <t:${epochNextStart}:t>`
+    : "**TBD**";
+
+  return [
+    "# 🕒 Terror Zone Status",
+    `_Updated: <t:${nowEpoch}:R>_  [Refresh](https://[[WORKER_URL_GOES_HERE]])`,
+    "## ⏳ Current",
+    currentLine,
+    "## 🔮 Next",
+    nextLine,
+  ].join("\n");
+}
+
+/* ========================================================================== */
+/* ====================== SECTION: ANNOUNCE/INFO CONTENT END ================= */
+/* ========================================================================== */
+
+
+/* ========================================================================== */
+/* ===================== SECTION: PERSISTENT MESSAGE MGMT START ============== */
+/* ========================================================================== */
+
+// Discord message IDs are snowflakes; numeric order == creation time order.
+function snowflakeLess(a, b) {
+  try { return BigInt(a) < BigInt(b); } catch { return String(a) < String(b); }
+}
+
+async function ensureInfoMessage(env, { currentZone, nextZone, epochNext }) {
+  const kv = env.TZ_KV;
+  const id = await kv.get(KV_INFO_ID);
+  const content = buildInfoMessage(currentZone, epochNext, nextZone, epochNext);
+
+  if (!id) {
+    const newId = await discordPost(env, content);
+    if (newId) await kv.put(KV_INFO_ID, newId);
+    return;
+  }
+
+  const r = await discordPatch(env, id, content);
+  if (!r.ok && (r.status === 404 || r.status === 405)) {
+    const newId = await discordPost(env, content);
+    if (newId) await kv.put(KV_INFO_ID, newId);
+  }
+}
+
+async function ensurePersistentPair(env, announceContent, infoContent) {
+  const kv = env.TZ_KV;
+
+  let announceId = await kv.get(KV_ANNOUNCE_ID);
+  let infoId     = await kv.get(KV_INFO_ID);
+
+  const recreateBoth = async () => {
+    if (announceId) { try { await discordDelete(env, announceId); } catch {} }
+    if (infoId)     { try { await discordDelete(env, infoId); } catch {} }
+
+    const newAnnounceId = await discordPost(env, announceContent);
+    const newInfoId     = await discordPost(env, infoContent);
+
+    if (newAnnounceId) await kv.put(KV_ANNOUNCE_ID, newAnnounceId);
+    if (newInfoId)     await kv.put(KV_INFO_ID, newInfoId);
+
+    announceId = newAnnounceId || null;
+    infoId     = newInfoId || null;
+  };
+
+  if (!announceId && !infoId) {
+    await recreateBoth();
+    return { announceId, infoId };
+  }
+
+  if (!announceId && infoId) {
+    // Creating announce now would invert order => recreate both.
+    await recreateBoth();
+    return { announceId, infoId };
+  }
+
+  if (announceId && !infoId) {
+    // Safe: create info after announce
+    const newInfoId = await discordPost(env, infoContent);
+    if (newInfoId) {
+      await kv.put(KV_INFO_ID, newInfoId);
+      infoId = newInfoId;
+    }
+    return { announceId, infoId };
+  }
+
+  if (announceId && infoId && !snowflakeLess(announceId, infoId)) {
+    await recreateBoth();
+    return { announceId, infoId };
+  }
+
+  return { announceId, infoId };
+}
+
+/* ========================================================================== */
+/* ====================== SECTION: PERSISTENT MESSAGE MGMT END =============== */
+/* ========================================================================== */
+
+
+/* ========================================================================== */
+/* ========================= SECTION: TRANSIENT PINGS START ================== */
+/* ========================================================================== */
+
+async function cleanupStalePing(env, nowEpoch) {
+  const kv = env.TZ_KV;
+  const id = await kv.get(KV_LAST_PING_ID);
+  if (!id) return;
+
+  const ts = parseInt(await kv.get(KV_LAST_PING_EPOCH) || "0", 10);
+  if (!ts) return;
+
+  if (nowEpoch > ts + PING_TTL_SECONDS) {
+    try { await discordDelete(env, id); } catch {}
+    await kvSoftDelete(kv, KV_LAST_PING_ID, 300);
+    await kvSoftDelete(kv, KV_LAST_PING_EPOCH, 300);
+  }
+}
+
+async function replaceTransientPing(env, content) {
+  const kv = env.TZ_KV;
+  const nowEpoch = Math.floor(Date.now() / 1000);
+
+  const prevId = await kv.get(KV_LAST_PING_ID);
+  if (prevId) { try { await discordDelete(env, prevId); } catch {} }
+
+  const roleId = env.DISCORD_ROLE_ID;
+  const allowed_mentions = roleId
+    ? { parse: [], roles: [roleId] }
+    : { parse: [] };
+
+  const newId = await discordPostWithAllowedMentions(env, content, allowed_mentions);
+  if (newId) {
+    await kv.put(KV_LAST_PING_ID, newId);
+    await kv.put(KV_LAST_PING_EPOCH, String(nowEpoch));
+  }
+}
+
+function buildLivePing(zoneCanon, zoneDisplay, roleId) {
+  const mention = roleId ? `<@&${roleId}> ` : "";
+  const theme = themed(zoneCanon);
+  const e = theme.header;          // e.g. "😈🔥"
+  const er = reverseEmojis(e);     // reversed, for symmetry (same style as banners)
+  return `${mention}⏳ ${e} ${zoneDisplay} ${er} ⏳`;
+}
+
+/* ========================================================================== */
+/* ========================== SECTION: TRANSIENT PINGS END =================== */
+/* ========================================================================== */
+
+
+/* ========================================================================== */
+/* ========================= SECTION: UPCOMING & LIVE START ================== */
+/* ========================================================================== */
+
+async function patchAnnouncementSlot(env, content) {
+  const kv = env.TZ_KV;
+  const id = await kv.get(KV_ANNOUNCE_ID);
+
+  if (!id) {
+    const newId = await discordPost(env, content);
+    if (newId) await kv.put(KV_ANNOUNCE_ID, newId);
+    return;
+  }
+
+  const r = await discordPatch(env, id, content);
+  if (!r.ok && (r.status === 404 || r.status === 405)) {
+    const newId = await discordPost(env, content);
+    if (newId) await kv.put(KV_ANNOUNCE_ID, newId);
+  }
+}
+
+function stageFor(mins) {
+  // 30-minute rotation => keep only 15/5 windows
+  if (mins >= 13 && mins <= 17) return "15min";
+  if (mins >= 3  && mins <= 7 ) return "5min";
+  return null;
+}
+
+async function maybeAnnounceFirstSeen(env, { zoneCanon, zoneDisplay, startEpoch }) {
+  const kv = env.TZ_KV;
+  const sentKey = `sent:${startEpoch}:${zoneCanon}:first`;
+  if (await kv.get(sentKey)) return;
+
+  const panelContent = buildUpcomingMessage(zoneCanon, zoneDisplay, startEpoch, "first", null);
+  await patchAnnouncementSlot(env, frameAnnouncement(panelContent));
+
+  const pingContent = buildUpcomingMessage(zoneCanon, zoneDisplay, startEpoch, "first", env.DISCORD_ROLE_ID);
+  await replaceTransientPing(env, pingContent);
+
+  await kv.put("upcoming_zone_canon", zoneCanon);
+  await kv.put("upcoming_zone_display", zoneDisplay);
+  await kv.put("upcoming_start_epoch", String(startEpoch));
+
+  await kv.put(sentKey, "1", { expirationTtl: 80 * 60 });
+}
+
+async function ensureUpcomingAlert(env, { zoneCanon, zoneDisplay, startEpoch, stage }) {
+  const kv = env.TZ_KV;
+  const sentKey = `sent:${startEpoch}:${zoneCanon}:${stage}`;
+  if (await kv.get(sentKey)) return;
+
+  const panelContent = buildUpcomingMessage(zoneCanon, zoneDisplay, startEpoch, stage, null);
+  await patchAnnouncementSlot(env, frameAnnouncement(panelContent));
+
+  const pingContent = buildUpcomingMessage(zoneCanon, zoneDisplay, startEpoch, stage, env.DISCORD_ROLE_ID);
+  await replaceTransientPing(env, pingContent);
+
+  await kv.put("upcoming_zone_canon", zoneCanon);
+  await kv.put("upcoming_zone_display", zoneDisplay);
+  await kv.put("upcoming_start_epoch", String(startEpoch));
+
+  await kv.put(sentKey, "1", { expirationTtl: 80 * 60 });
+}
+
+function buildUpcomingMessage(zoneCanon, zoneDisplay, startEpoch, stage, role, rawZoneName = null) {
+  const theme = themed(zoneCanon);
+  const headerLine = `# ${theme.header} ${zoneDisplay} ${reverseEmojis(theme.header)}`;
+  const mention = role ? `<@&${role}> ` : "";
+
+  let line = "";
+  if (stage === "first") {
+    const flavor = {
+      "Worldstone Keep": "Baal confirmed",
+      "Chaos Sanctuary": "Diablo’s seals loom",
+      "The Secret Cow Level": "Herd confirmed",
+      "Cathedral": "Andariel confirmed",
+      "Tower Cellar": "Countess confirmed",
+      "Nihlathak": "Halls confirmed",
+
+      "Tristram": "Tristram confirmed",
+      "Dry Hills": "Cube runs confirmed",
+      "Lost City": "Lost City confirmed",
+      "Arcane Sanctuary": "Sanctuary confirmed",
+      "Tal Rasha's Tombs": "Duriel confirmed",
+
+      "Flayer Jungle": "Jungle confirmed",
+      "Kurast Bazaar": "Kurast confirmed",
+      "Travincal": "Council confirmed",
+      "Durance of Hate": "Meph confirmed",
+
+      "Bloody Foothills": "Dodgeball confirmed",
+    }[zoneCanon] || "Zone confirmed";
+
+    line = `${mention}${flavor} — starts @ <t:${startEpoch}:t> (<t:${startEpoch}:R>).`;
+  } else if (stage === "15min") {
+    line = `${mention}15 minutes until it starts <t:${startEpoch}:R> @ <t:${startEpoch}:t>.`;
+  } else {
+    line = `${mention}Final call — starts <t:${startEpoch}:R> @ <t:${startEpoch}:t>!`;
+  }
+
+  const members = groupMembersForCanonOrRaw(zoneCanon, rawZoneName);
+  return `${headerLine}\n${line}${formatIncludesFootnote(members)}`;
+}
+
+function buildLiveMessage(zoneCanon, zoneDisplay, endEpoch, rawZoneName = null) {
+  const theme = themed(zoneCanon);
+  const headerLine = `# ${theme.header} ${zoneDisplay} ${reverseEmojis(theme.header)}`;
+  const line = `LIVE now — ends <t:${endEpoch}:R> @ <t:${endEpoch}:t>.`;
+  const members = groupMembersForCanonOrRaw(zoneCanon, rawZoneName);
+  return `${headerLine}\n${line}${formatIncludesFootnote(members)}`;
+}
+
+async function maybePromoteUpcomingToLive(env, now, { canonCurrentFromScrape, canonNextFromScrape }) {
+  const kv = env.TZ_KV;
+
+  const upStart = parseInt(await kv.get("upcoming_start_epoch") || "0", 10);
+  const upCanon = await kv.get("upcoming_zone_canon");
+  const upDisp  = await kv.get("upcoming_zone_display");
+  if (!upStart || !upCanon || !upDisp) return;
+
+  const nowEpoch = Math.floor(now.getTime() / 1000);
+
+  // If we’re ≥4 min after start and still have UPCOMING, broom it.
+  if (nowEpoch >= upStart + 4 * 60) {
+    await patchAnnouncementSlot(env, frameAnnouncement(buildAnnouncementDashboard()));
+    const upKeys = ["upcoming_zone_canon", "upcoming_zone_display", "upcoming_start_epoch"];
+    await Promise.all(upKeys.map(k => kvSoftDelete(kv, k, 300)));
+    return;
+  }
+
+  // Promote window: allow some slop around the boundary
+  const withinWindow = (nowEpoch >= upStart - 180) && (nowEpoch <= upStart + 300);
+
+  // Compare canonical values directly (no re-canonicalize)
+  const nameMatches =
+    (!!canonCurrentFromScrape && canonCurrentFromScrape === upCanon) ||
+    (!!canonNextFromScrape    && canonNextFromScrape    === upCanon);
+
+  if (!(withinWindow && nameMatches)) return;
+
+  const endEpoch = upStart + 1800;
+
+  // Banner becomes LIVE
+  const liveContent = buildLiveMessage(upCanon, upDisp, endEpoch);
+  await patchAnnouncementSlot(env, frameAnnouncement(liveContent));
+
+  // Brief LIVE ping (hourglasses + display)
+  await replaceTransientPing(env, buildLivePing(upCanon, upDisp, env.DISCORD_ROLE_ID));
+
+  // Write LIVE state
+  await kv.put("live_zone_canon", upCanon);
+  await kv.put("live_zone_display", upDisp);
+  await kv.put("live_start_epoch", String(upStart));
+  await kv.put("live_end_epoch", String(endEpoch));
+
+  // Clear UPCOMING state
+  const upKeys = ["upcoming_zone_canon", "upcoming_zone_display", "upcoming_start_epoch"];
+  await Promise.all(upKeys.map(k => kvSoftDelete(kv, k, 300)));
+}
+
+async function maintainLiveAlert(env, now) {
+  const kv = env.TZ_KV;
+
+  const endEpoch = parseInt(await kv.get("live_end_epoch") || "0", 10);
+  const canon    = await kv.get("live_zone_canon");
+  const display  = await kv.get("live_zone_display");
+
+  if (!endEpoch) return;
+
+  const nowEpoch = Math.floor(now.getTime() / 1000);
+
+  if (nowEpoch <= endEpoch) {
+    if (canon && display) {
+      const content = buildLiveMessage(canon, display, endEpoch);
+      await patchAnnouncementSlot(env, frameAnnouncement(content));
+    }
+    return;
+  }
+
+  if (nowEpoch > endEpoch + LIVE_DELETE_GRACE_S) {
+    await patchAnnouncementSlot(env, frameAnnouncement(buildAnnouncementDashboard()));
+    await clearLive(kv);
+  }
+  // grace window: do nothing
+}
+
+async function clearLive(kv) {
+  const keys = ["live_zone_canon", "live_zone_display", "live_start_epoch", "live_end_epoch"];
+  await Promise.all(keys.map(k => kvSoftDelete(kv, k, 300)));
+}
+
+/* ========================================================================== */
+/* ========================== SECTION: UPCOMING & LIVE END =================== */
+/* ========================================================================== */
+
+
+/* ========================================================================== */
+/* =========================== SECTION: DISCORD HTTP START =================== */
+/* ========================================================================== */
+
+// Preserve full webhook URL including any query (e.g., ?thread_id=...).
+function webhookUrlParts(env) {
+  const raw = env?.DISCORD_WEBHOOK_URL;
+  if (!raw || typeof raw !== "string" || !/^https?:\/\//i.test(raw)) return null;
+  const idx = raw.indexOf("?");
+  const path = (idx >= 0 ? raw.slice(0, idx) : raw).replace(/\/+$/, "");
+  const qs   = (idx >= 0 ? raw.slice(idx) : "");
+  return { path, qs };
+}
+function withWait(qs) {
+  if (!qs) return "?wait=true";
+  return qs.includes("wait=true") ? qs : `${qs}&wait=true`;
+}
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function fetchWithTimeout(url, init, timeoutMs) {
+  const ctl = new AbortController();
+  const id = setTimeout(() => ctl.abort(), timeoutMs);
+  try { return await fetch(url, { ...init, signal: ctl.signal }); }
+  finally { clearTimeout(id); }
+}
+
+async function discordFetch(env, url, init, attempts = DISCORD_ATTEMPTS) {
+  if (!env?.DISCORD_WEBHOOK_URL) return null;
+
+  let lastResponse = null;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const r = await fetchWithTimeout(url, init, DISCORD_TIMEOUT_MS);
+      lastResponse = r;
+      if (r.status !== 429 && r.status < 500) return r; // success or non-retriable
+    } catch {
+      lastResponse = null; // network error
+    }
+    if (i < attempts - 1) await sleep(2000);
+  }
+  return lastResponse;
+}
+
+async function discordPostWithAllowedMentions(env, content, allowed_mentions) {
+  const parts = webhookUrlParts(env);
+  if (!parts) return null;
+
+  const url = parts.path + withWait(parts.qs);
+  const r = await discordFetch(env, url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ content, allowed_mentions, flags: 4 }),
+  });
+
+  if (!r || !r.ok) return null;
+
+  try {
+    const j = await r.json();
+    return j.id || null;
+  } catch {
+    return null;
+  }
+}
+
+async function discordPost(env, content) {
+  const parts = webhookUrlParts(env);
+  if (!parts) return null;
+
+  const url = parts.path + withWait(parts.qs);
+  const r = await discordFetch(env, url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ content, flags: 4 }), // SUPPRESS_EMBEDS
+  });
+
+  if (!r || !r.ok) return null;
+
+  try {
+    const j = await r.json();
+    return j.id || null;
+  } catch {
+    return null;
+  }
+}
+
+async function discordPatch(env, messageId, content) {
+  const parts = webhookUrlParts(env);
+  if (!parts) return new Response(null, { status: 500 });
+
+  const url = `${parts.path}/messages/${messageId}${withWait(parts.qs)}`;
+  return await discordFetch(env, url, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ content, flags: 4 }),
+  });
+}
+
+async function discordDelete(env, messageId) {
+  const parts = webhookUrlParts(env);
+  if (!parts) return;
+  const url = `${parts.path}/messages/${messageId}` + (parts.qs || "");
+  await discordFetch(env, url, { method: "DELETE" });
+}
+
+/* ========================================================================== */
+/* ============================ SECTION: DISCORD HTTP END ==================== */
+/* ========================================================================== */
+
+
+/* ========================================================================== */
+/* ============================ SECTION: SCRAPER START ======================= */
+/* ========================================================================== */
+
+async function scrapeWithRetry(maxRetries, baseDelay, debug) {
+  let attempt = 0, delay = baseDelay;
+
+  while (attempt <= maxRetries) {
+    const res = await fetchWithTimeout(
+      SCRAPE_URL,
+      { headers: { "user-agent": "tz-worker/1.0" } },
+      SCRAPE_TIMEOUT_MS
+    );
+
+    if (res.ok) {
+      const html = await res.text();
+      const { currentZone, nextZone, diag } = extractZones(html);
+      if (debug) console.log("diag", diag);
+      return { currentZone, nextZone, diag: debug ? diag : undefined };
+    }
+
+    let retryMs = delay + Math.floor(Math.random() * delay);
+    const hRetry = res.headers.get("Retry-After");
+    if (hRetry) {
+      const secs = parseFloat(hRetry);
+      if (!Number.isNaN(secs)) retryMs = Math.max(retryMs, secs * 1000);
+    }
+    retryMs = Math.min(retryMs, 2000);
+
+    if (attempt === maxRetries) throw new Error(`scrape failed after retries: ${res.status}`);
+    await sleep(retryMs);
+
+    attempt += 1;
+    delay = Math.min(delay * 2, 2000);
+  }
+}
+
+/* ========================================================================== */
+/* ============================= SECTION: SCRAPER END ======================== */
+/* ========================================================================== */
+
+
+/* ========================================================================== */
+/* ====================== SECTION: PARSER & CANONICALIZER START ============== */
+/* ========================================================================== */
+
+function extractZones(html) {
+  const rows = html.match(/<tr[^>]*>[\s\S]*?<\/tr>/gi) || [];
+  let currentZone = null, nextZone = null;
+  let curRowFirstText = null, nextRowFirstText = null;
+
+  for (const row of rows) {
+    const firstTd = row.match(/<td[^>]*>([\s\S]*?)<\/td>/i)?.[1];
+    if (!firstTd) continue;
+    const firstText = stripTags(firstTd).trim().toLowerCase();
+
+    if (!currentZone && /\bcurrent\b/.test(firstText)) {
+      curRowFirstText = firstText; currentZone = firstZoneFromRow(row);
+    } else if (!nextZone && /\bnext\b/.test(firstText)) {
+      nextRowFirstText = firstText; nextZone = firstZoneFromRow(row);
+    }
+    if (currentZone && nextZone) break;
+  }
+
+  return {
+    currentZone: currentZone || null,
+    nextZone: nextZone || null,
+    diag: { curRowFirstText, nextRowFirstText },
+  };
+}
+
+function firstZoneFromRow(rowHtml) {
+  const m = rowHtml.match(/class\s*=\s*"[^"]*z-bone[^"]*"[\s\S]*?>([\s\S]*?)<\//i);
+  const t = m ? stripTags(m[1]).trim() : null;
+  return t || null;
+}
+
+function canonicalize(name) {
+  if (!name) return null;
+
+  const n = normZoneName(name);
+
+  ensureGroupIndexes();
+  const groupKey = ZONE_TO_GROUP_KEY.get(n);
+  if (groupKey) return groupKey;
+
+  if (/^Countess/i.test(n)) return "Tower Cellar";
+
+  return n;
+}
+
+/* ========================================================================== */
+/* ======================= SECTION: PARSER & CANONICALIZER END =============== */
+/* ========================================================================== */
+
+
+/* ========================================================================== */
+/* =============================== SECTION: UTILS START ====================== */
+/* ========================================================================== */
+
+function stripTags(s) {
+  return s.replace(/<script[\s\S]*?<\/script>/gi, "")
+          .replace(/<style[\s\S]*?<\/style>/gi, "")
+          .replace(/<[^>]+>/g, " ")
+          .replace(/\s+/g, " ");
+}
+
+async function kvSoftDelete(kv, key, ttlSeconds = 300) {
+  await kv.put(key, "", { expirationTtl: ttlSeconds });
+}
+
+/* ========================================================================== */
+/* ================================ SECTION: UTILS END ======================= */
+/* ========================================================================== */
