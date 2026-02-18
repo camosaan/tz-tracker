@@ -25,6 +25,22 @@ const LIVE_DELETE_GRACE_S = 90;
 // Transient ping message (new message => real notification)
 const KV_LAST_PING_ID     = "last_ping_message_id";
 const KV_LAST_PING_EPOCH  = "last_ping_message_epoch";
+const KV_PING_UP_LAST_ID    = "ping:up:last_id";
+const KV_PING_UP_LAST_EPOCH = "ping:up:last_epoch";
+const KV_PING_UP_STAGE      = "ping:up:stage";
+const KV_PING_LIVE_LAST_ID  = "ping:live:last_id";
+const KV_PING_LIVE_LAST_EPOCH = "ping:live:last_epoch";
+
+const KV_PING_UP_EXPIRES      = "ping:up:expires";
+const KV_PING_LIVE_EXPIRES    = "ping:live:expires";
+
+// Track which canon we last pinged LIVE for (so LIVE pings are only on transitions)
+const KV_PING_LIVE_CANON = "ping:live:canon";
+
+// Optional: track which upcoming target we last *discovered* (canon + start epoch)
+const KV_UP_CANON = "upcoming_zone_canon";
+const KV_UP_DISPLAY = "upcoming_zone_display";
+const KV_UP_START_EPOCH = "upcoming_start_epoch";
 const PING_TTL_SECONDS = 6 * 60; // 6 minutes
 
 // Persistent message slots
@@ -33,6 +49,118 @@ const KV_INFO_ID     = "persistent_info_message_id";     // slot #2 (bottom)
 
 /* ========================================================================== */
 /* ============================= SECTION: CONFIG END ========================= */
+/* ========================================================================== */
+
+
+/* ========================================================================== */
+/* ===================== SECTION: RUN GUARDS / IDEMPOTENCY START ============= */
+/* ========================================================================== */
+
+// Intra-run guard to prevent multiple helpers overwriting the same announcement banner.
+function makeRunState() {
+  return {
+    patchedAnnouncement: false,
+    announcementHash: null,
+    announcementMode: null,
+    setUpcomingThisRun: false,
+    setLiveThisRun: false,
+  };
+}
+
+// Small, fast non-crypto hash (FNV-1a-ish) for content de-dupe.
+function simpleHash(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(16);
+}
+
+/**
+ * Patch announcement slot with:
+ *  - intra-run guard (prevents multiple overwrites within the same invocation)
+ *  - cross-run hash de-dupe via KV (reduces churn + race surface)
+ *
+ * Uses KV keys:
+ *   - announce_last_hash
+ *   - announce_last_mode   ("dashboard" | "suppressed")
+ */
+async function patchAnnouncementOnce(env, runState, framedAnnouncement, mode = "unknown") {
+  if (!runState) return patchAnnouncementSlot(env, framedAnnouncement);
+
+  const h = simpleHash(String(framedAnnouncement ?? ""));
+
+  // Same content already written this run
+  if (runState.patchedAnnouncement && runState.announcementHash === h && runState.announcementMode === mode) {
+    return;
+  }
+
+  // Cross-run de-dupe: only skip if BOTH hash and mode match.
+  // (KV can be stale, so mode is the safety valve to prevent getting "stuck".)
+  const [lastHash, lastMode] = await Promise.all([
+    env.TZ_KV.get("announce_last_hash"),
+    env.TZ_KV.get("announce_last_mode"),
+  ]);
+
+  if (lastHash && lastHash === h && lastMode && lastMode === mode) {
+    runState.patchedAnnouncement = true;
+    runState.announcementHash = h;
+    runState.announcementMode = mode;
+    return;
+  }
+
+  await patchAnnouncementSlot(env, framedAnnouncement);
+
+  runState.patchedAnnouncement = true;
+  runState.announcementHash = h;
+  runState.announcementMode = mode;
+
+  await Promise.all([
+    env.TZ_KV.put("announce_last_hash", h),
+    env.TZ_KV.put("announce_last_mode", mode),
+  ]);
+}
+
+/**
+ * Best-effort KV lock. Not perfect (KV is eventually consistent), but greatly
+ * reduces duplicate recreates/overwrites from overlapping runs.
+ */
+async function withKvLock(kv, lockKey, ttlSeconds, fn) {
+  const token = crypto.randomUUID();
+  const now = Date.now();
+
+  const existing = await kv.get(lockKey);
+  if (existing) return { ok: false, reason: "locked" };
+
+  await kv.put(lockKey, JSON.stringify({ token, at: now }), { expirationTtl: ttlSeconds });
+
+  const check = await kv.get(lockKey);
+  if (!check) return { ok: false, reason: "lost_lock" };
+
+  try {
+    const parsed = JSON.parse(check);
+    if (!parsed || parsed.token !== token) return { ok: false, reason: "lost_lock" };
+  } catch {
+    return { ok: false, reason: "bad_lock" };
+  }
+
+  try {
+    return { ok: true, result: await fn() };
+  } finally {
+    // release best-effort
+    const finalCheck = await kv.get(lockKey);
+    if (finalCheck) {
+      try {
+        const parsed = JSON.parse(finalCheck);
+        if (parsed && parsed.token === token) await kv.delete(lockKey);
+      } catch {}
+    }
+  }
+}
+
+/* ========================================================================== */
+/* ===================== SECTION: RUN GUARDS / IDEMPOTENCY END =============== */
 /* ========================================================================== */
 
 
@@ -52,7 +180,7 @@ const WATCH_CANON_MAP = new Map([
   ["Dry Hills", "Cubed"],
   ["Lost City", "Lost City"],
   ["Arcane Sanctuary", "Sanctuary"],
-  ["Tal Rasha's Tombs", "Duriel"],
+  ["Tal Rasha's Tomb", "Duriel"],
 
   ["Flayer Jungle", "Lala Jungle"],
   ["Kurast Bazaar", "Kurast Tour"],
@@ -74,7 +202,7 @@ const ZONE_THEME = {
   "Dry Hills":             { header: "🧊🗃️" },
   "Lost City":             { header: "🏜️🦂" },
   "Arcane Sanctuary":      { header: "🌀✨" },
-  "Tal Rasha's Tombs":     { header: "🐛❄️" },
+  "Tal Rasha's Tomb":      { header: "🐛❄️" },
 
   "Flayer Jungle":         { header: "🌿🗡️" },
   "Kurast Bazaar":         { header: "🛕🌿" },
@@ -86,6 +214,14 @@ const ZONE_THEME = {
 
 const GENERIC = { header: "⚔️🔥" };
 const themed = (canon) => ZONE_THEME[canon] || GENERIC;
+
+
+// Display name for a canon zone (group key). Tracked zones can override via WATCH_CANON_MAP.
+function zoneDisplayForCanon(zoneCanon) {
+  if (!zoneCanon) return null;
+  return WATCH_CANON_MAP.get(zoneCanon) || zoneCanon;
+}
+
 const reverseEmojis = (s) => [...s].reverse().join("");
 
 function displayFor(canon) {
@@ -104,24 +240,25 @@ function displayFor(canon) {
 
 const ZONE_GROUPS = [
   // Act 1
+  ["Blood Moor", "Den of Evil"],  
   ["Cold Plains", "Cave"],
   ["Burial Grounds", "Crypt", "Mausoleum"],
-  ["Tristram", "Stony Field"],
+  ["Stony Field", "Tristram" ],
   ["Dark Wood", "Underground Passage"],
-  ["Tower Cellar", "Black Marsh", "Hole", "Forgotten Tower"],
+  ["Black Marsh","Tower Cellar", "The Hole", "Forgotten Tower"],
   ["Jail", "Barracks"],
-  ["Pit", "Tamoe Highland", "Outer Cloister"],
+  ["Tamoe Highland", "The Pit", "Outer Cloister"],
   ["Cathedral", "Inner Cloister", "Catacombs"],
-  ["The Secret Cow Level", "Secret Cow Level"],
+  ["The Secret Cow Level"],
 
   // Act 2
-  ["Sewers"],
+  ["The Sewers"],
   ["Rocky Waste", "Stony Tomb"],
   ["Dry Hills", "Halls of the Dead"],
   ["Far Oasis", "Maggot Lair"],
   ["Lost City", "Valley of Snakes", "Claw Viper Temple", "Ancient Tunnels"],
   ["Arcane Sanctuary", "Harem", "Palace"],
-  ["Tal Rasha's Tombs", "Canyon of the Magi"],
+  ["Tal Rasha's Tomb", "Canyon of the Magi"],
 
   // Act 3
   ["Spider Forest", "Spider Cavern", "Arachnid Lair"],
@@ -142,7 +279,7 @@ const ZONE_GROUPS = [
   ["Crystalline Passage", "Frozen River"],
   ["Frozen Tundra", "Infernal Pit"],
   ["Arreat Plateau", "Pit of Acheron"],
-  ["Nihlathak", "Nihlathak's Temple", "Halls of Anguish", "Halls of Pain", "Halls of Vaught"],
+  ["Nihlathak's Temple", "Nihlathak", "Halls of Anguish", "Halls of Pain", "Halls of Vaught"],
   ["Ancient's Way", "Icy Cellar"],
   ["Worldstone Keep", "Throne of Destruction", "Worldstone Chamber"],
 ];
@@ -150,6 +287,20 @@ const ZONE_GROUPS = [
 const ZONE_TO_GROUP_KEY = new Map();
 const GROUP_KEY_TO_MEMBERS = new Map();
 let GROUP_INDEX_BUILT = false;
+
+// Some zone names on the source site appear without their leading article.
+// Add explicit aliases here so grouping/theming/display can still resolve correctly.
+const ZONE_ALIASES = new Map([
+  ["Hole", "The Hole"],
+]);
+
+// Optional: custom display labels for zone groups (keyed by GROUP KEY = first item in the group array).
+// Example: ["Black Marsh", "The Countess"]
+function applyZoneAlias(normName) {
+  if (!normName) return normName;
+  return ZONE_ALIASES.get(normName) || normName;
+}
+
 
 function normZoneName(s) {
   return (s || "")
@@ -173,11 +324,22 @@ function ensureGroupIndexes() {
 
 function groupMembersForRawZone(rawZoneName) {
   ensureGroupIndexes();
-  const z = normZoneName(rawZoneName);
-  if (!z) return [];
-  const key = ZONE_TO_GROUP_KEY.get(z);
+  const z0 = normZoneName(rawZoneName);
+  if (!z0) return [];
+  const z = applyZoneAlias(z0);
+
+  const key = ZONE_TO_GROUP_KEY.get(z) || ZONE_TO_GROUP_KEY.get(z0);
   return key ? (GROUP_KEY_TO_MEMBERS.get(key) || []) : [];
 }
+
+function groupKeyForRawZone(rawZoneName) {
+  ensureGroupIndexes();
+  const z0 = normZoneName(rawZoneName);
+  if (!z0) return null;
+  const z = applyZoneAlias(z0);
+  return ZONE_TO_GROUP_KEY.get(z) || ZONE_TO_GROUP_KEY.get(z0) || null;
+}
+
 
 function groupMembersForCanonOrRaw(zoneCanon, rawZoneName) {
   ensureGroupIndexes();
@@ -230,6 +392,8 @@ async function run(env, debug = false) {
   if (!env || !env.TZ_KV) throw new Error("Missing KV binding TZ_KV");
   const kv = env.TZ_KV;
 
+  const runState = makeRunState();
+
   const { currentZone, nextZone, diag } =
     await scrapeWithRetry(SCRAPE_MAX_RETRIES, SCRAPE_BASE_DELAY, debug);
 
@@ -249,12 +413,16 @@ async function run(env, debug = false) {
 
   const epochNext  = Math.floor(nextBoundary.getTime() / 1000);
   const minsToNext = Math.floor((nextBoundary - now) / 60000);
+  const stage = stageFor(minsToNext);
 
   const canonCurrent = canonicalize(currentZone);
   const canonNext    = canonicalize(nextZone);
 
-  // Always cleanup old transient ping message (so the channel stays tidy)
-  await cleanupStalePing(env, nowEpoch);
+  // Transient ping housekeeping:
+  // - We keep separate "UPCOMING" and "LIVE" transient slots.
+  // - We also try to cleanup any legacy single-slot ping pointers if they exist.
+  await cleanupLegacyPingPointers(env, nowEpoch);
+  await cleanupExpiredPings(env, nowEpoch);
 
   // Ensure the 2 persistent messages exist and are correctly ordered
   const dashFramed  = frameAnnouncement(buildAnnouncementDashboard());
@@ -264,48 +432,59 @@ async function run(env, debug = false) {
   // Keep the Info message current (persistent slot #2)
   await ensureInfoMessage(env, { currentZone, nextZone, epochNext });
 
-  // Maintain LIVE banner (refresh while live; revert after end+grace)
-  await maintainLiveAlert(env, now);
+  // M  // ------------------------------
+  // PINGS (centralized, 2-track)
+  // ------------------------------
+  // We allow up to 2 pings per run:
+  // - LIVE slot: when a tracked CURRENT zone becomes live (transition)
+  // - UPCOMING slot: discovered / 15min / 5min for tracked NEXT
+  //
+  // Each slot enforces: delete-before-send. If a delete fails, we keep the ID and retry later.
 
-  // First-seen ping (once per hour per watched Next)
   const nextDisplayName = canonNext ? displayFor(canonNext) : null;
-  if (canonNext && WATCH_CANON_MAP.has(canonNext) && nextDisplayName) {
-    await maybeAnnounceFirstSeen(env, {
-      zoneCanon: canonNext,
-      zoneDisplay: nextDisplayName,
-      startEpoch: epochNext,
-    });
-  }
+  const currentDisplayName = canonCurrent ? displayFor(canonCurrent) : null;
 
-  // Timed stage pings (15/5) with KV de-dupe
-  const stage = stageFor(minsToNext);
-  if (stage && canonNext && WATCH_CANON_MAP.has(canonNext) && nextDisplayName) {
-    await ensureUpcomingAlert(env, {
-      zoneCanon: canonNext,
-      zoneDisplay: nextDisplayName,
-      startEpoch: epochNext,
-      stage,
-    });
-  }
-
-  // Promotion (UPCOMING -> LIVE) + broom for lingering upcoming
-  await maybePromoteUpcomingToLive(env, now, {
-    canonCurrentFromScrape: canonCurrent,
-    canonNextFromScrape: canonNext,
+  const desired = await computeDesiredPings(env, {
+    canonCurrent,
+    currentDisplayName,
+    canonNext,
+    nextDisplayName,
+    epochNext,
+    minsToNext,
+    nowEpoch,
   });
 
-  // If there's no LIVE and no UPCOMING state right now, keep the banner as the dashboard
-  const liveEndEpoch = parseInt(await kv.get("live_end_epoch") || "0", 10);
-  const hasLive = !!liveEndEpoch && nowEpoch <= (liveEndEpoch + LIVE_DELETE_GRACE_S);
-
-  const upStart = parseInt(await kv.get("upcoming_start_epoch") || "0", 10);
-  const hasUpcoming = !!upStart && nowEpoch < (upStart + 10 * 60);
-
-  if (!hasLive && !hasUpcoming) {
-    await patchAnnouncementSlot(env, frameAnnouncement(buildAnnouncementDashboard()));
+  // Prefer LIVE first (boundary moments), then UPCOMING.
+  if (desired.live) {
+    await sendPingInSlot(env, "live", desired.live);
+  }
+  if (desired.upcoming) {
+    await sendPingInSlot(env, "up", desired.upcoming);
   }
 
-  return {
+  // NOTE: LIVE/UPCOMING pings are fully handled by computeDesiredPings + sendPingInSlot.
+  // Any legacy LIVE promotion flow has been removed to avoid duplicate/mis-timed pings.
+
+  // Banner behavior (simplified):
+  // 1) When no tracked zone is LIVE or NEXT (from the current scrape), show the full dashboard banner.
+  // 2) When a tracked zone is LIVE or NEXT, show only the lower border line.
+  //
+  // We intentionally use the current scrape (canonCurrent/canonNext) so stale KV windows
+  // can't keep the banner suppressed.
+
+  const isTrackedNow =
+    (!!canonCurrent && WATCH_CANON_MAP.has(canonCurrent)) ||
+    (!!canonNext && WATCH_CANON_MAP.has(canonNext));
+
+  const mode = isTrackedNow ? "suppressed" : "dashboard";
+
+  if (mode === "suppressed") {
+    await patchAnnouncementOnce(env, runState, frameAnnouncement(buildAnnouncementSuppressed()), "suppressed");
+  } else {
+    await patchAnnouncementOnce(env, runState, frameAnnouncement(buildAnnouncementDashboard()), "dashboard");
+  }
+
+return {
     ok: true,
     currentZone,
     nextZone,
@@ -325,44 +504,93 @@ async function run(env, debug = false) {
 /* ========================================================================== */
 
 function frameAnnouncement(content) {
-  const DIVIDER = "────────────────────────────────────────────────────────────";
-  return `${(content ?? "").trim()}\n\n${DIVIDER}`;
+  return `${(content ?? "").trim()}`;
 }
 
 function buildAnnouncementDashboard() {
+  const BORDER = "✦────────────────◇────────────────✦";
+
   return [
-    "# 🗑️ Terror Zones are trash right now so why not try...",
-    "## 🔑 [Keys](https://maxroll.gg/d2/meta/ubers-explained#why-do-i-farm-hellfire-torches?-header) • 💰 [Trav](https://maxroll.gg/d2/meta/travincal-farming-guide) • 🐄 [Cows](https://maxroll.gg/d2/meta/the-secret-cow-level-farming-guide)",
-    "## 👑 [Baal](https://maxroll.gg/d2/meta/worldstone-keep-and-baal-farming-guide) • 😈 [Ubers](https://maxroll.gg/d2/meta/ubers-explained#why-do-i-farm-hellfire-torches?-header) • 🧪 [Craft](https://maxroll.gg/d2/items/crafted-items)",
+    BORDER,
+    "## TZones are kinda 🐶💩 so…",
     "",
+    "### 😈 [Sanc](https://maxroll.gg/d2/meta/chaos-sanctuary-farming-guide) • 👑 [Baal](https://maxroll.gg/d2/meta/worldstone-keep-and-baal-farming-guide) • 🐄 [Cows](https://maxroll.gg/d2/meta/the-secret-cow-level-farming-guide) • 😈 [Ubers](https://maxroll.gg/d2/meta/ubers-explained#why-do-i-farm-hellfire-torches?-header)",
+    "### 🔑 [Keys](https://maxroll.gg/d2/meta/ubers-explained#why-do-i-farm-hellfire-torches?-header) • 💰 [Trav](https://maxroll.gg/d2/meta/travincal-farming-guide) • 🧪 [Craft](https://maxroll.gg/d2/items/crafted-items) • 🛠️ [Builds](https://maxroll.gg/d2)",
+    "",
+    BORDER,
   ].join("\n");
+}
+
+function buildAnnouncementSuppressed() {
+  // "Suppressed" banner = only the lower border line (as per your simplified banner rules)
+  const BORDER = "✦────────────────◇────────────────✦";
+  return BORDER;
 }
 
 function buildInfoMessage(currentZone, epochCurrentEnd, nextZone, epochNextStart) {
   const nowEpoch = Math.floor(Date.now() / 1000);
+  const BORDER = "✦────────────────◇────────────────✦";
 
-  const curMembers = currentZone ? groupMembersForRawZone(currentZone) : [];
-  const nxtMembers = nextZone ? groupMembersForRawZone(nextZone) : [];
+  const curCanon = currentZone ? canonicalize(currentZone) : null;
+  const nxtCanon = nextZone ? canonicalize(nextZone) : null;
 
-  const curLabel = formatPoolInline(curMembers, currentZone);
-  const nxtLabel = formatPoolInline(nxtMembers, nextZone);
+  const curMembers = groupMembersForCanonOrRaw(curCanon, currentZone);
+  const nxtMembers = groupMembersForCanonOrRaw(nxtCanon, nextZone);
 
-  const currentLine = currentZone
-    ? `${curLabel} — ends <t:${epochCurrentEnd}:R>`
-    : "**Unknown**";
+  const curMain = curCanon ? zoneDisplayForCanon(curCanon) : null;
+  const nxtMain = nxtCanon ? zoneDisplayForCanon(nxtCanon) : null;
 
-  const nextLine = nextZone
-    ? `${nxtLabel} — starts @ <t:${epochNextStart}:t>`
-    : "**TBD**";
+  const isTrackedLive = !!curCanon && WATCH_CANON_MAP.has(curCanon);
+  const isTrackedNext = !!nxtCanon && WATCH_CANON_MAP.has(nxtCanon);
+
+  // ---- LIVE icons ----
+  let liveLeftIcon = "⚔️";
+  let liveRightIcon = "⚔️";
+  if (isTrackedLive) {
+    const e = themed(curCanon).header;
+    liveLeftIcon = e;
+    liveRightIcon = reverseEmojis(e);
+  }
+
+  // NEXT icons (keep crystal balls)
+  const nextLeftIcon = "🔮";
+  const nextRightIcon = "🔮";
+
+  // ---- LIVE block ----
+  const liveName = curMain ? curMain.toUpperCase() : "TBD";
+  const liveTitleCore = `${liveLeftIcon} LIVE: ${liveName} ${liveRightIcon}`;
+  const liveTitleWrapped = isTrackedLive ? `⭐ ${liveTitleCore} ⭐` : liveTitleCore;
+
+  const liveTitle = `## **${liveTitleWrapped}**`;
+  const liveEnds  = `### **⏳ Ends <t:${epochCurrentEnd}:R> ⏳**`;
+  const liveZones = `**Zones:** ${curMembers.length ? curMembers.join(", ") : "—"}`;
+
+  const liveBlock = [liveTitle, liveEnds, liveZones].join("\n");
+
+  // ---- NEXT block ----
+  const nextName = nxtMain ? nxtMain.toUpperCase() : "TBD";
+  const nextTitleCore = `${nextLeftIcon} NEXT: ${nextName} ${nextRightIcon}`;
+  const nextTitleWrapped = isTrackedNext ? `⭐ ${nextTitleCore} ⭐` : nextTitleCore;
+
+  const nextTitle  = `## **${nextTitleWrapped}**`;
+  const nextStarts = `### **⏳ Starts <t:${epochNextStart}:R> ⏳**`;
+  const nextZones  = `**Zones:** ${nxtMembers.length ? nxtMembers.join(", ") : "—"}`;
+
+  const nextBlock = [nextTitle, nextStarts, nextZones].join("\n");
+
+  const footer = `_Updated: <t:${nowEpoch}:R>_  [Refresh](https://tz-tracker.csturnbull.workers.dev/)`;
 
   return [
-    "# 🕒 Terror Zone Status",
-    `_Updated: <t:${nowEpoch}:R>_  [Refresh](https://[[WORKER_URL_GOES_HERE]])`,
-    "## ⏳ Current",
-    currentLine,
-    "## 🔮 Next",
-    nextLine,
-  ].join("\n");
+    liveBlock,
+    "",
+    BORDER,
+    nextBlock,
+    "",
+    BORDER,
+    footer,
+  ]
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n");
 }
 
 /* ========================================================================== */
@@ -418,13 +646,25 @@ async function ensurePersistentPair(env, announceContent, infoContent) {
   };
 
   if (!announceId && !infoId) {
-    await recreateBoth();
+    const lockRes = await withKvLock(kv, "lock:persistent_pair", 30, recreateBoth);
+    if (!lockRes.ok) {
+      // Another overlapping run is recreating; re-read IDs and return.
+      announceId = await kv.get(KV_ANNOUNCE_ID);
+      infoId     = await kv.get(KV_INFO_ID);
+      return { announceId, infoId };
+    }
     return { announceId, infoId };
   }
 
   if (!announceId && infoId) {
     // Creating announce now would invert order => recreate both.
-    await recreateBoth();
+    const lockRes = await withKvLock(kv, "lock:persistent_pair", 30, recreateBoth);
+    if (!lockRes.ok) {
+      // Another overlapping run is recreating; re-read IDs and return.
+      announceId = await kv.get(KV_ANNOUNCE_ID);
+      infoId     = await kv.get(KV_INFO_ID);
+      return { announceId, infoId };
+    }
     return { announceId, infoId };
   }
 
@@ -439,7 +679,13 @@ async function ensurePersistentPair(env, announceContent, infoContent) {
   }
 
   if (announceId && infoId && !snowflakeLess(announceId, infoId)) {
-    await recreateBoth();
+    const lockRes = await withKvLock(kv, "lock:persistent_pair", 30, recreateBoth);
+    if (!lockRes.ok) {
+      // Another overlapping run is recreating; re-read IDs and return.
+      announceId = await kv.get(KV_ANNOUNCE_ID);
+      infoId     = await kv.get(KV_INFO_ID);
+      return { announceId, infoId };
+    }
     return { announceId, infoId };
   }
 
@@ -474,6 +720,11 @@ async function replaceTransientPing(env, content) {
   const kv = env.TZ_KV;
   const nowEpoch = Math.floor(Date.now() / 1000);
 
+  // Guard: if we posted a ping very recently, don't post another.
+  // This preserves "hit URL to refresh" but stops double-pings from back-to-back runs.
+  const lastTs = parseInt(await kv.get(KV_LAST_PING_EPOCH) || "0", 10);
+  if (lastTs && (nowEpoch - lastTs) < 25) return;
+
   const prevId = await kv.get(KV_LAST_PING_ID);
   if (prevId) { try { await discordDelete(env, prevId); } catch {} }
 
@@ -495,6 +746,19 @@ function buildLivePing(zoneCanon, zoneDisplay, roleId) {
   const e = theme.header;          // e.g. "😈🔥"
   const er = reverseEmojis(e);     // reversed, for symmetry (same style as banners)
   return `${mention}⏳ ${e} ${zoneDisplay} ${er} ⏳`;
+}
+
+function buildUpcomingPing(zoneCanon, zoneDisplay, startEpoch, stage, roleId) {
+  const mention = roleId ? `<@&${roleId}> ` : "";
+  const m = minsUntil(startEpoch);
+
+  const e  = themed(zoneCanon).header;
+  const er = reverseEmojis(e);
+
+  // Keep it push-friendly: plain text minutes.
+  // Add a little urgency for 5min.
+  const bang = (stage === "5min") ? "!" : ".";
+  return `${mention}⏳ ${e} ${zoneDisplay} ${er} — starts in ${m}m${bang} ⏳`;
 }
 
 /* ========================================================================== */
@@ -530,46 +794,331 @@ function stageFor(mins) {
   return null;
 }
 
-async function maybeAnnounceFirstSeen(env, { zoneCanon, zoneDisplay, startEpoch }) {
-  const kv = env.TZ_KV;
-  const sentKey = `sent:${startEpoch}:${zoneCanon}:first`;
-  if (await kv.get(sentKey)) return;
 
-  const panelContent = buildUpcomingMessage(zoneCanon, zoneDisplay, startEpoch, "first", null);
-  await patchAnnouncementSlot(env, frameAnnouncement(panelContent));
+/* -------------------------------------------------------------------------- */
+/* ----------------------- SECTION: PING MANAGER START ---------------------- */
+/* -------------------------------------------------------------------------- */
 
-  const pingContent = buildUpcomingMessage(zoneCanon, zoneDisplay, startEpoch, "first", env.DISCORD_ROLE_ID);
-  await replaceTransientPing(env, pingContent);
-
-  await kv.put("upcoming_zone_canon", zoneCanon);
-  await kv.put("upcoming_zone_display", zoneDisplay);
-  await kv.put("upcoming_start_epoch", String(startEpoch));
-
-  await kv.put(sentKey, "1", { expirationTtl: 80 * 60 });
+function pingSlotKeys(slot) {
+  if (slot === "live") return { id: KV_PING_LIVE_LAST_ID, epoch: KV_PING_LIVE_LAST_EPOCH };
+  return { id: KV_PING_UP_LAST_ID, epoch: KV_PING_UP_LAST_EPOCH }; // default "up"
 }
 
-async function ensureUpcomingAlert(env, { zoneCanon, zoneDisplay, startEpoch, stage }) {
+async function cleanupLegacyPingPointers(env, nowEpoch) {
   const kv = env.TZ_KV;
-  const sentKey = `sent:${startEpoch}:${zoneCanon}:${stage}`;
+
+  // If we already migrated, nothing to do.
+  const upId = await kv.get(KV_PING_UP_LAST_ID);
+  const liveId = await kv.get(KV_PING_LIVE_LAST_ID);
+
+  const legacyId = await kv.get(KV_LAST_PING_ID);
+  const legacyTs = parseInt(await kv.get(KV_LAST_PING_EPOCH) || "0", 10);
+
+  // Migrate any legacy pointer to the UPCOMING slot (best-effort).
+  if (!upId && !liveId && legacyId) {
+    await kv.put(KV_PING_UP_LAST_ID, legacyId);
+    if (legacyTs) await kv.put(KV_PING_UP_LAST_EPOCH, String(legacyTs));
+    await Promise.all([
+      kvSoftDelete(kv, KV_LAST_PING_ID, 300),
+      kvSoftDelete(kv, KV_LAST_PING_EPOCH, 300),
+    ]);
+    return;
+  }
+
+  // Keep legacy TTL cleanup for safety (in case the legacy keys linger).
+  if (legacyId && legacyTs && nowEpoch > legacyTs + PING_TTL_SECONDS) {
+    const ok = await discordDelete(env, legacyId);
+    if (ok) {
+      await Promise.all([
+        kvSoftDelete(kv, KV_LAST_PING_ID, 300),
+        kvSoftDelete(kv, KV_LAST_PING_EPOCH, 300),
+      ]);
+    }
+  }
+}
+
+
+async function cleanupExpiredSlot(env, slot, nowEpoch) {
+  const kv = env.TZ_KV;
+  const { id: idKey, epoch: epochKey } = pingSlotKeys(slot);
+  const expKey = (slot === "live") ? KV_PING_LIVE_EXPIRES : KV_PING_UP_EXPIRES;
+
+  const exp = parseInt(await kv.get(expKey) || "0", 10);
+  if (!exp || nowEpoch <= exp) return;
+
+  const lastId = await kv.get(idKey);
+  if (!lastId) {
+    await kvSoftDelete(kv, expKey, 300);
+    return;
+  }
+
+  const ok = await discordDelete(env, lastId);
+  if (!ok) return; // keep ID, retry next run
+
+  await Promise.all([
+    kvSoftDelete(kv, idKey, 300),
+    kvSoftDelete(kv, epochKey, 300),
+    kvSoftDelete(kv, expKey, 300),
+  ]);
+}
+
+async function cleanupExpiredPings(env, nowEpoch) {
+  // LIVE ping cleanup: remove the last LIVE ping after the live window ends (+ grace),
+  // but only if it still exists and can be deleted. If delete fails, keep the ID and retry.
+  const kv = env.TZ_KV;
+
+  const liveEnd = parseInt(await kv.get("live_end_epoch") || "0", 10);
+  if (!liveEnd) return;
+
+  if (nowEpoch <= (liveEnd + LIVE_DELETE_GRACE_S)) return;
+
+  const liveId = await kv.get(KV_PING_LIVE_LAST_ID);
+  if (!liveId) return;
+
+  const ok = await discordDelete(env, liveId);
+  if (!ok) return;
+
+  const keys = [
+    KV_PING_LIVE_LAST_ID,
+    KV_PING_LIVE_LAST_EPOCH,
+    KV_PING_LIVE_EXPIRES,
+    KV_PING_LIVE_CANON,
+    "live_zone_canon",
+    "live_zone_display",
+    "live_start_epoch",
+    "live_end_epoch",
+  ];
+
+  await Promise.all(keys.map(k => kvSoftDelete(kv, k, 300)));
+}
+
+async function acquirePingLock(kv, slot) {
+  // Best-effort lock to reduce overlap duplicates.
+  // KV is eventual, so this is not perfect, but it helps.
+  const key = `lock:ping:${slot}`;
+  const existing = await kv.get(key);
+  if (existing) return false;
+  await kv.put(key, "1", { expirationTtl: 60 });
+  return true;
+}
+
+async function sendPingInSlot(env, slot, desiredPing) {
+  const kv = env.TZ_KV;
+  const { id: idKey, epoch: epochKey } = pingSlotKeys(slot);
+  const expKey = (slot === "live") ? KV_PING_LIVE_EXPIRES : KV_PING_UP_EXPIRES;
+
+  // Best-effort lock per slot.
+  const locked = await acquirePingLock(kv, slot);
+  if (!locked) return;
+
+  // If we're sending a LIVE ping for a zone that was previously UPCOMING,
+  // delete the UPCOMING slot message first so the LIVE ping becomes the only
+  // remaining message for that zone. Enforces delete-before-send across lanes.
+  if (slot === "live" && desiredPing && desiredPing.clearUpcoming) {
+    const upId = await kv.get(KV_PING_UP_LAST_ID);
+    if (upId) {
+      const okUp = await discordDelete(env, upId);
+      if (!okUp) return; // keep UPCOMING ID, retry next run
+    }
+    await Promise.all([
+      kvSoftDelete(kv, KV_PING_UP_LAST_ID, 300),
+      kvSoftDelete(kv, KV_PING_UP_LAST_EPOCH, 300),
+      kvSoftDelete(kv, KV_PING_UP_EXPIRES, 300),
+      kvSoftDelete(kv, KV_PING_UP_STAGE, 300),
+      kvSoftDelete(kv, KV_UP_CANON, 300),
+      kvSoftDelete(kv, KV_UP_DISPLAY, 300),
+      kvSoftDelete(kv, KV_UP_START_EPOCH, 300),
+    ]);
+  }
+
+  const lastId = await kv.get(idKey);
+
+  // Enforce delete-before-send. If delete fails, keep ID and retry next run.
+  if (lastId) {
+    const ok = await discordDelete(env, lastId);
+    if (!ok) return;
+
+    await Promise.all([
+      kvSoftDelete(kv, idKey, 300),
+      kvSoftDelete(kv, epochKey, 300),
+      kvSoftDelete(kv, expKey, 300),
+    ]);
+  }
+
+  if (!desiredPing) return;
+
+  const sentKey = `sent:${desiredPing.key}`;
   if (await kv.get(sentKey)) return;
 
-  const panelContent = buildUpcomingMessage(zoneCanon, zoneDisplay, startEpoch, stage, null);
-  await patchAnnouncementSlot(env, frameAnnouncement(panelContent));
+  const roleId = env.DISCORD_ROLE_ID;
+  const allowed_mentions = roleId
+    ? { parse: [], roles: [roleId] }
+    : { parse: [] };
 
-  const pingContent = buildUpcomingMessage(zoneCanon, zoneDisplay, startEpoch, stage, env.DISCORD_ROLE_ID);
+  const newId = await discordPostWithAllowedMentions(env, desiredPing.content, allowed_mentions);
+  if (!newId) return;
+
+  // Record the new transient ping pointer for this slot.
+  const nowEpoch = desiredPing.nowEpoch || Math.floor(Date.now() / 1000);
+  await kv.put(idKey, newId);
+  await kv.put(epochKey, String(nowEpoch));
+  if (desiredPing.expiresEpoch) await kv.put(expKey, String(desiredPing.expiresEpoch));
+
+  // Mark sent AFTER success (prevents "claimed-but-never-posted" suppression).
+  await kv.put(sentKey, "1", { expirationTtl: desiredPing.sentTtlSeconds || 80 * 60 });
+
+  // Optional success-side KV writes (state tracking).
+  if (desiredPing.onSuccessPuts && Array.isArray(desiredPing.onSuccessPuts)) {
+    for (const put of desiredPing.onSuccessPuts) {
+      if (!put || !put.k) continue;
+      if (put.ttl) await kv.put(put.k, put.v, { expirationTtl: put.ttl });
+      else await kv.put(put.k, put.v);
+    }
+  }
+}
+
+async function computeDesiredPings(env, { canonCurrent, currentDisplayName, canonNext, nextDisplayName, epochNext, minsToNext, nowEpoch }) {
+  const kv = env.TZ_KV;
+
+  const desired = { live: null, upcoming: null };
+
+  const stageRank = (s) => {
+    if (s === "disc") return 0;
+    if (s === "15min") return 1;
+    if (s === "5min") return 2;
+    return -1;
+  };
+
+  // -----------------------
+  // LIVE (tracked CURRENT)
+  // -----------------------
+  if (canonCurrent && currentDisplayName && WATCH_CANON_MAP.has(canonCurrent)) {
+    const liveStart = epochNext - 1800;
+    const storedCanon = await kv.get("live_zone_canon");
+    const storedStart = parseInt(await kv.get("live_start_epoch") || "0", 10);
+
+    const upCanon = await kv.get(KV_UP_CANON);
+    const upStart = parseInt(await kv.get(KV_UP_START_EPOCH) || "0", 10);
+
+    // Transition detected (new live zone or new live window).
+    if (storedCanon !== canonCurrent || storedStart !== liveStart) {
+      desired.live = {
+        key: `live:${liveStart}:${canonCurrent}`,
+        // If the UPCOMING lane was tracking the same zone for the same window, clear it before sending LIVE.
+        clearUpcoming: (upCanon === canonCurrent && upStart === liveStart),
+        content: buildLivePing(canonCurrent, currentDisplayName, env.DISCORD_ROLE_ID),
+        nowEpoch,
+        sentTtlSeconds: 90 * 60,
+        onSuccessPuts: [
+          { k: "live_zone_canon", v: canonCurrent },
+          { k: "live_zone_display", v: currentDisplayName },
+          { k: "live_start_epoch", v: String(liveStart) },
+          { k: "live_end_epoch", v: String(epochNext) },
+          // legacy/optional marker
+          { k: KV_PING_LIVE_CANON, v: canonCurrent, ttl: 6 * 60 * 60 },
+        ],
+      };
+    }
+  }
+
+  // --------------------------
+  // UPCOMING (tracked NEXT)
+  // --------------------------
+  if (canonNext && nextDisplayName && WATCH_CANON_MAP.has(canonNext)) {
+    const prevCanon = await kv.get(KV_UP_CANON);
+    const prevStart = parseInt(await kv.get(KV_UP_START_EPOCH) || "0", 10);
+    const prevStage = await kv.get(KV_PING_UP_STAGE) || "";
+
+    // New upcoming target (different from last tracked upcoming): DISCOVERED replaces anything prior.
+    if (prevCanon !== canonNext || prevStart !== epochNext) {
+      desired.upcoming = {
+        key: `up:${epochNext}:${canonNext}:disc`,
+        content: buildUpcomingPing(canonNext, nextDisplayName, epochNext, "first", env.DISCORD_ROLE_ID),
+        nowEpoch,
+        sentTtlSeconds: 90 * 60,
+        onSuccessPuts: [
+          { k: KV_UP_CANON, v: canonNext },
+          { k: KV_UP_DISPLAY, v: nextDisplayName },
+          { k: KV_UP_START_EPOCH, v: String(epochNext) },
+          { k: KV_PING_UP_STAGE, v: "disc" },
+        ],
+      };
+    } else {
+      const stage = stageFor(minsToNext); // "15min" | "5min" | null
+      if (stage && stageRank(stage) > stageRank(prevStage)) {
+        desired.upcoming = {
+          key: `up:${epochNext}:${canonNext}:${stage}`,
+          content: buildUpcomingPing(canonNext, nextDisplayName, epochNext, stage, env.DISCORD_ROLE_ID),
+          nowEpoch,
+          sentTtlSeconds: 90 * 60,
+          onSuccessPuts: [
+            { k: KV_UP_CANON, v: canonNext },
+            { k: KV_UP_DISPLAY, v: nextDisplayName },
+            { k: KV_UP_START_EPOCH, v: String(epochNext) },
+            { k: KV_PING_UP_STAGE, v: stage },
+          ],
+        };
+      }
+    }
+  }
+
+  return desired;
+}
+
+/* -------------------------------------------------------------------------- */
+/* ------------------------ SECTION: PING MANAGER END ----------------------- */
+/* -------------------------------------------------------------------------- */
+
+async function maybeAnnounceFirstSeen(env, { zoneCanon, zoneDisplay, startEpoch }, runState) {
+  const kv = env.TZ_KV;
+  const sentKey = `sent:${startEpoch}:${zoneCanon}:first`;
+
+  // De-dupe
+  if (await kv.get(sentKey)) return;
+
+  // CLAIM FIRST to prevent overlap duplicates (cron + manual refresh, etc.)
+  await kv.put(sentKey, "1", { expirationTtl: 80 * 60 });
+
+  if (runState) runState.setUpcomingThisRun = true;
+
+  // 2) Send SIMPLE transient ping (one line, push-friendly)
+  const pingContent = buildUpcomingPing(zoneCanon, zoneDisplay, startEpoch, "first", env.DISCORD_ROLE_ID);
   await replaceTransientPing(env, pingContent);
 
+  // Keep upcoming metadata for promote->LIVE as before
   await kv.put("upcoming_zone_canon", zoneCanon);
   await kv.put("upcoming_zone_display", zoneDisplay);
   await kv.put("upcoming_start_epoch", String(startEpoch));
+}
 
+async function ensureUpcomingAlert(env, { zoneCanon, zoneDisplay, startEpoch, stage }, runState) {
+  const kv = env.TZ_KV;
+  const sentKey = `sent:${startEpoch}:${zoneCanon}:${stage}`;
+
+  // De-dupe
+  if (await kv.get(sentKey)) return;
+
+  // CLAIM FIRST to prevent overlap duplicates
   await kv.put(sentKey, "1", { expirationTtl: 80 * 60 });
+
+  if (runState) runState.setUpcomingThisRun = true;
+
+  // 2) SIMPLE transient ping (one line)
+  const pingContent = buildUpcomingPing(zoneCanon, zoneDisplay, startEpoch, stage, env.DISCORD_ROLE_ID);
+  await replaceTransientPing(env, pingContent);
+
+  // Keep upcoming metadata for promote->LIVE
+  await kv.put("upcoming_zone_canon", zoneCanon);
+  await kv.put("upcoming_zone_display", zoneDisplay);
+  await kv.put("upcoming_start_epoch", String(startEpoch));
 }
 
 function buildUpcomingMessage(zoneCanon, zoneDisplay, startEpoch, stage, role, rawZoneName = null) {
   const theme = themed(zoneCanon);
   const headerLine = `# ${theme.header} ${zoneDisplay} ${reverseEmojis(theme.header)}`;
   const mention = role ? `<@&${role}> ` : "";
+
+  const m = minsUntil(startEpoch);
 
   let line = "";
   if (stage === "first") {
@@ -595,11 +1144,12 @@ function buildUpcomingMessage(zoneCanon, zoneDisplay, startEpoch, stage, role, r
       "Bloody Foothills": "Dodgeball confirmed",
     }[zoneCanon] || "Zone confirmed";
 
-    line = `${mention}${flavor} — starts @ <t:${startEpoch}:t> (<t:${startEpoch}:R>).`;
+    line = `${mention}${flavor} — starts in ${m}m.`;
   } else if (stage === "15min") {
-    line = `${mention}15 minutes until it starts <t:${startEpoch}:R> @ <t:${startEpoch}:t>.`;
+    line = `${mention}⏳ starts in ${m}m.`;
   } else {
-    line = `${mention}Final call — starts <t:${startEpoch}:R> @ <t:${startEpoch}:t>!`;
+    // "5min"
+    line = `${mention}⏳ starts in ${m}m!`;
   }
 
   const members = groupMembersForCanonOrRaw(zoneCanon, rawZoneName);
@@ -614,7 +1164,7 @@ function buildLiveMessage(zoneCanon, zoneDisplay, endEpoch, rawZoneName = null) 
   return `${headerLine}\n${line}${formatIncludesFootnote(members)}`;
 }
 
-async function maybePromoteUpcomingToLive(env, now, { canonCurrentFromScrape, canonNextFromScrape }) {
+async function maybePromoteUpcomingToLive(env, now, { canonCurrentFromScrape, canonNextFromScrape }, runState) {
   const kv = env.TZ_KV;
 
   const upStart = parseInt(await kv.get("upcoming_start_epoch") || "0", 10);
@@ -626,7 +1176,6 @@ async function maybePromoteUpcomingToLive(env, now, { canonCurrentFromScrape, ca
 
   // If we’re ≥4 min after start and still have UPCOMING, broom it.
   if (nowEpoch >= upStart + 4 * 60) {
-    await patchAnnouncementSlot(env, frameAnnouncement(buildAnnouncementDashboard()));
     const upKeys = ["upcoming_zone_canon", "upcoming_zone_display", "upcoming_start_epoch"];
     await Promise.all(upKeys.map(k => kvSoftDelete(kv, k, 300)));
     return;
@@ -644,9 +1193,18 @@ async function maybePromoteUpcomingToLive(env, now, { canonCurrentFromScrape, ca
 
   const endEpoch = upStart + 1800;
 
-  // Banner becomes LIVE
-  const liveContent = buildLiveMessage(upCanon, upDisp, endEpoch);
-  await patchAnnouncementSlot(env, frameAnnouncement(liveContent));
+  // -----------------------------------------
+  // De-dupe LIVE promotion ping (missing before)
+  // -----------------------------------------
+  const sentLiveKey = `sent:${upStart}:${upCanon}:live`;
+
+  // If already sent, do nothing (prevents duplicate LIVE pings)
+  if (await kv.get(sentLiveKey)) return;
+
+  // Claim first (best-effort; KV is eventual, but this closes the main hole)
+  await kv.put(sentLiveKey, "1", { expirationTtl: 80 * 60 });
+
+  if (runState) runState.setLiveThisRun = true;
 
   // Brief LIVE ping (hourglasses + display)
   await replaceTransientPing(env, buildLivePing(upCanon, upDisp, env.DISCORD_ROLE_ID));
@@ -657,12 +1215,12 @@ async function maybePromoteUpcomingToLive(env, now, { canonCurrentFromScrape, ca
   await kv.put("live_start_epoch", String(upStart));
   await kv.put("live_end_epoch", String(endEpoch));
 
-  // Clear UPCOMING state
+  // Clear UPCOMING state (soft delete / blank values)
   const upKeys = ["upcoming_zone_canon", "upcoming_zone_display", "upcoming_start_epoch"];
   await Promise.all(upKeys.map(k => kvSoftDelete(kv, k, 300)));
 }
 
-async function maintainLiveAlert(env, now) {
+async function maintainLiveAlert(env, now, runState) {
   const kv = env.TZ_KV;
 
   const endEpoch = parseInt(await kv.get("live_end_epoch") || "0", 10);
@@ -674,22 +1232,18 @@ async function maintainLiveAlert(env, now) {
   const nowEpoch = Math.floor(now.getTime() / 1000);
 
   if (nowEpoch <= endEpoch) {
-    if (canon && display) {
-      const content = buildLiveMessage(canon, display, endEpoch);
-      await patchAnnouncementSlot(env, frameAnnouncement(content));
-    }
+    if (runState) runState.setLiveThisRun = true;
     return;
   }
 
   if (nowEpoch > endEpoch + LIVE_DELETE_GRACE_S) {
-    await patchAnnouncementSlot(env, frameAnnouncement(buildAnnouncementDashboard()));
     await clearLive(kv);
   }
   // grace window: do nothing
 }
 
 async function clearLive(kv) {
-  const keys = ["live_zone_canon", "live_zone_display", "live_start_epoch", "live_end_epoch"];
+  const keys = ["live_zone_canon", "live_zone_display", "live_start_epoch", "live_end_epoch", KV_PING_LIVE_CANON];
   await Promise.all(keys.map(k => kvSoftDelete(kv, k, 300)));
 }
 
@@ -798,9 +1352,15 @@ async function discordPatch(env, messageId, content) {
 
 async function discordDelete(env, messageId) {
   const parts = webhookUrlParts(env);
-  if (!parts) return;
+  if (!parts) return false;
+
   const url = `${parts.path}/messages/${messageId}` + (parts.qs || "");
-  await discordFetch(env, url, { method: "DELETE" });
+  const r = await discordFetch(env, url, { method: "DELETE" });
+
+  // Treat "not found" as already-deleted success.
+  if (!r) return false;
+  if (r.status === 404) return true;
+  return !!r.ok;
 }
 
 /* ========================================================================== */
@@ -888,10 +1448,11 @@ function firstZoneFromRow(rowHtml) {
 function canonicalize(name) {
   if (!name) return null;
 
-  const n = normZoneName(name);
+  const n0 = normZoneName(name);
+  const n  = applyZoneAlias(n0);
 
   ensureGroupIndexes();
-  const groupKey = ZONE_TO_GROUP_KEY.get(n);
+  const groupKey = ZONE_TO_GROUP_KEY.get(n) || ZONE_TO_GROUP_KEY.get(n0);
   if (groupKey) return groupKey;
 
   if (/^Countess/i.test(n)) return "Tower Cellar";
@@ -917,6 +1478,12 @@ function stripTags(s) {
 
 async function kvSoftDelete(kv, key, ttlSeconds = 300) {
   await kv.put(key, "", { expirationTtl: ttlSeconds });
+}
+
+function minsUntil(epochSeconds, nowMs = Date.now()) {
+  const diffMs = (epochSeconds * 1000) - nowMs;
+  // Floor so we don’t overstate remaining time
+  return Math.max(0, Math.floor(diffMs / 60000));
 }
 
 /* ========================================================================== */
